@@ -29,7 +29,7 @@ the seed changes. solve-shell and `seed_lab.py --fix` both use it.
 """
 
 import lab_config as cfg
-from csp_client import info, ok
+from csp_client import info, object_url, ok
 
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +123,7 @@ def break_dhcp_range_overlap(client, ids):
     no scaffolding, which is the best assessment signal in the track.
     """
     broken = cfg.BRANCH_RANGE_BROKEN
-    client.patch(cfg.path("dhcp_range") + f"/{ids['range_id']}", json_body={
+    client.patch(object_url(cfg.path("dhcp_range"), ids["range_id"]), json_body={
         "start": broken["start"],
         "end": broken["end"],
     })
@@ -132,7 +132,7 @@ def break_dhcp_range_overlap(client, ids):
 
 
 def assert_dhcp_range_overlap(client, ids):
-    dhcp_range = client.get(cfg.path("dhcp_range") + f"/{ids['range_id']}")
+    dhcp_range = client.get(object_url(cfg.path("dhcp_range"), ids["range_id"]))
     dhcp_range = dhcp_range.get("result", dhcp_range)
     start, end = dhcp_range.get("start"), dhcp_range.get("end")
 
@@ -156,7 +156,7 @@ def assert_dhcp_range_overlap(client, ids):
 
 def fix_dhcp_range_overlap(client, ids):
     healthy = cfg.BRANCH_RANGE_HEALTHY
-    client.patch(cfg.path("dhcp_range") + f"/{ids['range_id']}", json_body={
+    client.patch(object_url(cfg.path("dhcp_range"), ids["range_id"]), json_body={
         "start": healthy["start"],
         "end": healthy["end"],
     })

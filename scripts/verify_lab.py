@@ -30,7 +30,7 @@ import sys
 import baseline
 import lab_config as cfg
 from csp_client import (CspClient, CspError, LabTodo, clear_reason, fail, info,
-                        ok, read_state)
+                        object_url, ok, read_state)
 
 
 def load_ids():
@@ -364,7 +364,7 @@ def check_c4(client, ids):
                  f"(treated as denied)")
 
     # -- The unguided break has been fixed -----------------------------------
-    dhcp_range = client.get(cfg.path("dhcp_range") + f"/{ids['range_id']}")
+    dhcp_range = client.get(object_url(cfg.path("dhcp_range"), ids["range_id"]))
     dhcp_range = dhcp_range.get("result", dhcp_range)
     start, end = dhcp_range.get("start"), dhcp_range.get("end")
 

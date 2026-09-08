@@ -141,6 +141,46 @@ PY
 if [ $? -eq 0 ]; then pass "topology is self-consistent"; else fail "topology is inconsistent"; fi
 
 # --------------------------------------------------------------------------- #
+step "Object URLs are built with object_url()"
+# A CSP `id` is a resource identifier ("dns/auth_zone/<uuid>"), not a bare UUID.
+# Concatenating one onto its own collection path yields a doubled path and an
+# HTTP 501 that reads like an unsupported verb. Cost a track start once.
+# csp_client.py is excluded: object_url()'s docstring quotes the bad pattern in
+# order to warn against it.
+offenders=$(grep -rn 'cfg\.path([^)]*) *+ *f"/' ./*.py \
+            | grep -v '^\./csp_client\.py:' || true)
+if [ -n "${offenders}" ]; then
+  fail "these build an object URL by concatenation instead of object_url():"
+  printf '%s\n' "${offenders}" | sed 's/^/      /'
+else
+  pass "no id concatenated onto a collection path"
+fi
+
+python3 - <<'PY'
+import sys
+from csp_client import object_url
+
+cases = [
+    # (collection, id, expected)
+    ("/api/ddi/v1/dns/auth_zone", "dns/auth_zone/abc-123",
+     "/api/ddi/v1/dns/auth_zone/abc-123"),            # the real CSP shape
+    ("/api/ddi/v1/dns/auth_zone", "abc-123",
+     "/api/ddi/v1/dns/auth_zone/abc-123"),            # already-stripped
+    ("/api/ddi/v1/ipam/range", "ipam/range/xyz-9",
+     "/api/ddi/v1/ipam/range/xyz-9"),
+    ("/api/ddi/v1/dns/view/", "dns/view/v1",
+     "/api/ddi/v1/dns/view/v1"),                      # stray trailing slash
+]
+bad = [(c, i, object_url(c, i), e) for c, i, e in cases if object_url(c, i) != e]
+if bad:
+    for c, i, got, want in bad:
+        print(f"      object_url({c!r}, {i!r}) -> {got!r}, wanted {want!r}")
+    sys.exit(1)
+print(f"      {len(cases)} URL cases correct")
+PY
+if [ $? -eq 0 ]; then pass "object_url normalises both id forms"; else fail "object_url is wrong"; fi
+
+# --------------------------------------------------------------------------- #
 step "API key expiry format"
 # This exact format is what CSP accepts on POST /v2/current_api_keys. Getting it
 # wrong returns a 400 that names neither the field nor the expectation, so it is

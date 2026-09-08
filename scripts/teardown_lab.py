@@ -30,7 +30,8 @@ import os
 import sys
 
 import lab_config as cfg
-from csp_client import CspClient, CspError, LabTodo, info, ok, read_state
+from csp_client import (CspClient, CspError, LabTodo, info, object_url, ok,
+                        read_state)
 
 
 # Reverse-dependency order. Each entry is (registry key, human label).
@@ -73,7 +74,7 @@ def release_host_first(client, ids):
         # Both representations: we do not know which one this run used, and
         # clearing the wrong one leaves the zone pinned to an object we are
         # about to delete.
-        client.patch(cfg.path("dns_auth_zone") + f"/{zone_id}",
+        client.patch(object_url(cfg.path("dns_auth_zone"), zone_id),
                      json_body={"internal_secondaries": [], "nsgs": []})
         info(f"released {cfg.ZONE_FQDN} from its authoritative servers")
     except (CspError, LabTodo) as exc:
@@ -111,7 +112,7 @@ def purge(client, registry_key, label, dry_run):
 
         try:
             # csp_client.delete() accepts 404 — deleting twice is a no-op.
-            client.delete(f"{collection}/{obj_id}")
+            client.delete(object_url(collection, obj_id))
             info(f"deleted {label[:-1]}: {name}")
             removed += 1
         except CspError as exc:

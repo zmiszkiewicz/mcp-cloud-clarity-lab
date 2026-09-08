@@ -24,7 +24,7 @@ findings shape this file and are worth knowing before editing:
 """
 
 import lab_config as cfg
-from csp_client import info, ok
+from csp_client import info, object_url, ok
 
 
 LAB_TAGS = {cfg.LAB_TAG_KEY: cfg.LAB_TAG_VALUE}
@@ -289,7 +289,7 @@ def set_authoritative_servers(client, zone_id, authority, attached=True):
     else:
         body = {"nsgs": [authority["id"]] if attached else []}
 
-    client.patch(cfg.path("dns_auth_zone") + f"/{zone_id}", json_body=body)
+    client.patch(object_url(cfg.path("dns_auth_zone"), zone_id), json_body=body)
     return body
 
 
@@ -302,7 +302,7 @@ def authoritative_server_ids(client, zone_id):
     the Portal might well add whichever kind the UI offered them, and the check
     should credit that rather than insisting on the one the seeder used.
     """
-    zone = client.get(cfg.path("dns_auth_zone") + f"/{zone_id}")
+    zone = client.get(object_url(cfg.path("dns_auth_zone"), zone_id))
     zone = zone.get("result", zone)
 
     ids = [entry.get("host")

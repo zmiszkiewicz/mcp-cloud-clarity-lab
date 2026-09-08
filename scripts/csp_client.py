@@ -42,6 +42,27 @@ class CspError(RuntimeError):
         super().__init__(f"{method} {url} -> HTTP {status}: {body[:400]}")
 
 
+def object_url(collection, obj_id):
+    """
+    The URL for one object, given its collection path and its id.
+
+    ALWAYS USE THIS. Never write `cfg.path("dns_auth_zone") + f"/{obj['id']}"`.
+
+    CSP does not return bare UUIDs. An object's `id` is a *resource identifier*
+    — a relative path like `dns/auth_zone/d5c39dcd-...` — which is exactly what
+    you must send back in a request BODY when referencing it (`{"zone": <id>}`,
+    `{"host": <id>}`). But concatenating it onto its own collection path
+    produces `/api/ddi/v1/dns/auth_zone/dns/auth_zone/d5c39dcd-...`, and CSP
+    answers that with **HTTP 501 Not Implemented** — which reads like an
+    unsupported verb rather than a malformed path, and cost a track start.
+
+    So: full resource identifier in bodies, last segment in URLs. This function
+    is the second half of that rule, and it accepts either form so it is safe to
+    call on an id you have already stripped.
+    """
+    return f"{collection.rstrip('/')}/{str(obj_id).rstrip('/').rsplit('/', 1)[-1]}"
+
+
 def read_state(key, required=True):
     """Read one of the state files setup-shell wrote into SCRIPT_DIR."""
     filename = cfg.STATE_FILES[key]
@@ -171,6 +192,25 @@ class CspClient:
                 last = f"HTTP {resp.status_code}"
                 time.sleep(min(2 ** attempt + random.random(), 20))
                 continue
+
+            # CSP answers an unrecognised path with 501 Not Implemented, which
+            # reads like an unsupported HTTP verb rather than a bad URL. The
+            # usual cause is a doubled collection segment from concatenating a
+            # resource identifier onto its own collection path.
+            if resp.status_code == 501:
+                segments = [s for s in url.split("?")[0].split("/") if s]
+                doubled = next(
+                    (segments[i] for i in range(len(segments) - 2)
+                     if segments[i] == segments[i + 2]), None)
+                if doubled:
+                    raise CspError(
+                        method, url, resp.status_code,
+                        resp.text + f"  <-- the path repeats '{doubled}', so it "
+                        "is malformed rather than unimplemented. A CSP `id` is "
+                        "a resource identifier like 'dns/auth_zone/<uuid>', not "
+                        "a bare UUID: send it whole in a request BODY, but use "
+                        "csp_client.object_url() to build a URL from it.",
+                    )
 
             # CSP's 400 for a missing or malformed timestamp is
             # `HTTP interceptor error: invalid datetime or duration` — it names
