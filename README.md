@@ -17,7 +17,7 @@ scripts/
   breaks.py             2 breaks, each with apply / assert / fix
   seed_lab.py           THE entry point: baseline -> breaks -> assert
   verify_lab.py         --stage c1..c4, end-state checks only
-  provision_mcp_keys.py service users + read-only and read/write keys
+  provision_mcp_keys.py the MCP service user and its read/write key
   revoke_mcp_keys.py    idempotent key revoke + service user delete
   teardown_lab.py       remove seeded objects; safe to run twice
   preflight.sh          offline checks; run before every git push
@@ -54,7 +54,7 @@ python3 verify_lab.py --stage all               # every check, smoke test
 
 python3 pick_bedrock_model.py --list            # every invokable Claude model
 bash setup_claude_code.sh                       # install + configure the assistant
-bash setup_claude_code.sh --keys-only           # re-register after a key swap
+bash setup_claude_code.sh --keys-only           # re-register the MCP servers
 claude mcp list                                 # live connection test
 
 python3 teardown_lab.py --dry-run               # list what would be deleted
@@ -270,12 +270,21 @@ would quietly run a different model *and* bill at the Opus rate.
 `pick_bedrock_model.py` confirms the pin is invokable in the account and falls
 back to the newest available Sonnet if not.
 
-**The key handover costs a restart.** The old agent re-read its key file every
-turn, so Part 2's read-only → read/write swap was live. Claude Code bakes the
-auth header into the MCP registration, so `02/setup-shell` rewrites the key,
-re-runs `setup_claude_code.sh --keys-only`, and the assignment tells the
-participant to restart Claude Code. That lands on the challenge boundary, where
-they are switching tabs anyway.
+**There is no key handover any more.** The track used to mint two keys and swap
+them at Part 2 and Part 4, so that CSP — not the prose — enforced "the assistant
+could not have written even if it tried". Claude Code bakes the auth header in
+at registration, so each swap also needed a restart the participant had no
+reason to expect, and they arrived at Part 2 unable to make the change the
+assignment had just told them to make. One read/write key now covers the track.
+
+What carried the lesson was never the key. It is the approval prompt before
+every tool call, and the assistant being made to state its intended change
+first. Part 4's access-control exercise moved to a boundary that holds with any
+key: user administration is not exposed through the MCP Server at all.
+
+`MCP_ROLES=read_only,read_write` restores the two-key flow —
+`provision_mcp_keys.py`, `revoke_mcp_keys.py` and `check_c4` all still support
+it.
 
 ## The Part 3 test VM has no internet, and that shapes the probe
 
