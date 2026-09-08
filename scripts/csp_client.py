@@ -172,6 +172,22 @@ class CspClient:
                 time.sleep(min(2 ** attempt + random.random(), 20))
                 continue
 
+            # CSP's 400 for a missing or malformed timestamp is
+            # `HTTP interceptor error: invalid datetime or duration` — it names
+            # neither the field nor the endpoint's expectation, and it reads
+            # like a transport fault rather than a payload one. It cost a track
+            # start once; annotate it so it never costs another.
+            if (resp.status_code == 400
+                    and "invalid datetime or duration" in resp.text):
+                raise CspError(
+                    method, url, resp.status_code,
+                    resp.text + "  <-- a required RFC3339 timestamp is missing "
+                    "or malformed in this request body (e.g. expires_at on "
+                    "/v2/current_api_keys). CSP wants "
+                    "YYYY-MM-DDTHH:MM:SS.000Z — note the literal Z and the "
+                    "millisecond precision; datetime.isoformat() gives neither.",
+                )
+
             raise CspError(method, url, resp.status_code, resp.text)
 
         raise CspError(method, url, 0, f"gave up after {MAX_RETRIES} attempts: {last}")

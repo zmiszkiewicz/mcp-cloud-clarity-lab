@@ -41,6 +41,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import random
 import string
 import sys
@@ -72,6 +73,26 @@ ROLES = {
         "key_id_state": "mcp_rw_key_id",
     },
 }
+
+
+def key_expiry():
+    """
+    The `expires_at` value for a new Service API key.
+
+    REQUIRED by POST /v2/current_api_keys. Leaving it out returns
+    HTTP 400 `HTTP interceptor error: invalid datetime or duration` — a message
+    that names neither the missing field nor the endpoint's expectation.
+
+    The format matters as much as the presence: RFC3339, UTC, millisecond
+    precision, literal `Z` suffix. That is what the estate's deploy_api_key.py
+    has always sent and what CSP accepts. `datetime.isoformat()` produces
+    `+00:00` instead of `Z` and microsecond rather than millisecond precision,
+    so it is built explicitly here rather than left to the default.
+    """
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        hours=cfg.MCP_KEY_TTL_HOURS
+    )
+    return expires.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def generate_password(length=16):
@@ -271,8 +292,11 @@ def mint_key_as_user(email, password, account_id, label):
     user_client._set_jwt(jwt)
     user_client.switch_account(account_id)
 
+    expires_at = key_expiry()
     created = user_client.post(cfg.path("current_api_keys"), json_body={
         "name": f"mcp-{label.replace('/', '-')}-{cfg.PARTICIPANT_ID}",
+        # Required. See key_expiry() — omitting this is a 400, not a default.
+        "expires_at": expires_at,
     })
     result = created.get("result", created)
 
@@ -284,7 +308,7 @@ def mint_key_as_user(email, password, account_id, label):
             f"Fields returned: {sorted(result)}"
         )
 
-    ok(f"minted {label} Service API key ({key_id})")
+    ok(f"minted {label} Service API key ({key_id}), expires {expires_at}")
     return key_id, key
 
 

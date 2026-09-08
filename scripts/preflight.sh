@@ -141,6 +141,43 @@ PY
 if [ $? -eq 0 ]; then pass "topology is self-consistent"; else fail "topology is inconsistent"; fi
 
 # --------------------------------------------------------------------------- #
+step "API key expiry format"
+# This exact format is what CSP accepts on POST /v2/current_api_keys. Getting it
+# wrong returns a 400 that names neither the field nor the expectation, so it is
+# cheap to assert here and expensive to discover live.
+python3 - <<'PY'
+import datetime
+import re
+import sys
+
+import provision_mcp_keys as p
+
+value = p.key_expiry()
+problems = []
+
+if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", value):
+    problems.append(f"{value!r} is not YYYY-MM-DDTHH:MM:SS.mmmZ")
+
+# Must be in the future, or the key is dead on arrival.
+parsed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.000Z").replace(
+    tzinfo=datetime.timezone.utc)
+now = datetime.datetime.now(datetime.timezone.utc)
+if parsed <= now:
+    problems.append(f"{value} is not in the future")
+
+# Must outlive the track's 90-minute time limit with room to spare.
+if (parsed - now) < datetime.timedelta(hours=2):
+    problems.append(f"{value} expires in under 2h — shorter than a lab run")
+
+if problems:
+    for problem in problems:
+        print(f"      {problem}")
+    sys.exit(1)
+print(f"      expires_at renders as {value}")
+PY
+if [ $? -eq 0 ]; then pass "key expiry is well formed and in the future"; else fail "key expiry is malformed"; fi
+
+# --------------------------------------------------------------------------- #
 step "Assignments match the config"
 # The single-source-of-truth rule from the track flow: every value the prose
 # names must come from lab_config. This catches the specific failure where

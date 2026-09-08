@@ -178,6 +178,22 @@ MCP_RW_GROUPS = [
 MCP_RO_GROUP = os.environ.get("MCP_RO_GROUP")
 MCP_RW_GROUP = os.environ.get("MCP_RW_GROUP")
 
+# How long a minted Service API key lives.
+#
+# POST /v2/current_api_keys REQUIRES expires_at. Omitting it does not default to
+# anything — CSP rejects the call with
+# `HTTP interceptor error: invalid datetime or duration`, which is a 400 that
+# names neither the field nor the endpoint's expectation. That message cost a
+# track start; if you see it again on any CSP POST, look for a missing or
+# malformed timestamp before anything else.
+#
+# 24 hours rather than the estate's traditional hardcoded far-future date. The
+# track runs for 90 minutes and cleanup revokes both keys explicitly, so this is
+# only the backstop for a cleanup that did not run — and a backstop measured in
+# hours is worth having. A hardcoded calendar date is also a time bomb: it works
+# until it silently does not.
+MCP_KEY_TTL_HOURS = int(os.environ.get("MCP_KEY_TTL_HOURS", "24"))
+
 # State files written by setup, read by checks and teardown. All live in
 # SCRIPT_DIR because that is the working directory the vendored iracic82
 # scripts assume.
