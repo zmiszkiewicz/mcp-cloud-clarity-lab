@@ -56,9 +56,22 @@ def report_candidates():
               "package. The agent cannot connect to anything.")
         return False
 
+    import inspect
+
     print(f"\nTransport candidates, in order:")
-    for label, _ in candidates:
-        print(f"  {label}")
+    for label, factory in candidates:
+        try:
+            sig = inspect.signature(factory)
+            params = list(sig.parameters)
+            if "headers" in params:
+                auth = "headers= (mcp 1.x style)"
+            elif "http_client" in params:
+                auth = "http_client= (mcp 2.x style)"
+            else:
+                auth = "NO AUTH PARAMETER — connection will be unauthenticated"
+            print(f"  {label}\n      signature: {sig}\n      auth via: {auth}")
+        except (TypeError, ValueError):
+            print(f"  {label}\n      signature: <not introspectable>")
     return True
 
 

@@ -231,10 +231,10 @@ class McpFleet:
         for label, factory in _transport_candidates():
             try:
                 streams = await self._exit_stack.enter_async_context(
-                    factory(self.infoblox_url, headers=auth_headers())
+                    await self._invoke_factory(factory)
                 )
-                # streamablehttp yields (read, write, get_session_id); sse yields
-                # (read, write). Take the first two either way.
+                # 1.x streamablehttp yields (read, write, get_session_id); 2.x
+                # and sse yield (read, write). Take the first two either way.
                 read, write = streams[0], streams[1]
                 session = await self._exit_stack.enter_async_context(
                     ClientSession(read, write)
@@ -260,6 +260,54 @@ class McpFleet:
               "is gated by role-based access control: a service user with no "
               "MCP Server role is refused outright rather than degraded."
         ) from last_exc
+
+    async def _invoke_factory(self, factory):
+        """
+        Call a transport factory with authentication, whichever way it takes it.
+
+        THE 1.x / 2.x SPLIT. These are not the same function:
+
+            # mcp 1.x
+            streamablehttp_client(url, headers={...})
+                -> yields (read, write, get_session_id)
+
+            # mcp 2.x  — renamed, and headers are gone
+            streamable_http_client(url, *, http_client=None,
+                                   terminate_on_close=True)
+                -> yields (read, write)
+
+        In 2.x authentication goes on a pre-built httpx client instead of a
+        headers kwarg, so passing `headers=` raises TypeError — the function is
+        found, and then the call fails. Inspecting the signature and choosing
+        the right form handles both lines without pinning either.
+
+        The httpx client we build here is entered into the same exit stack as
+        the session, so it closes with the turn rather than leaking a connection
+        pool per message.
+        """
+        import inspect
+
+        headers = auth_headers()
+
+        try:
+            params = inspect.signature(factory).parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        if "headers" in params:
+            return factory(self.infoblox_url, headers=headers)
+
+        if "http_client" in params:
+            import httpx
+            client = await self._exit_stack.enter_async_context(
+                httpx.AsyncClient(headers=headers, timeout=60.0)
+            )
+            return factory(self.infoblox_url, http_client=client)
+
+        # Neither — call it bare and let the connection attempt report why.
+        # Unauthenticated, so this will almost certainly be refused, but a 401
+        # is a far more useful message than a TypeError about kwargs.
+        return factory(self.infoblox_url)
 
     async def _connect_aws(self):
         """
