@@ -21,20 +21,14 @@ scripts/
   revoke_mcp_keys.py    idempotent key revoke + service user delete
   teardown_lab.py       remove seeded objects; safe to run twice
   preflight.sh          offline checks; run before every git push
-  pick_bedrock_model.py asks Bedrock which Claude models this account can invoke
-  mcp_probe.py          what the mcp package exposes, and does the server answer
+  setup_claude_code.sh  install + configure Claude Code and both MCP servers
+  pick_bedrock_model.py verify the pinned model is invokable in this account
   traffic/README.md     iq-insighter wiring (TODO-19)
   ...vendored from iracic82, unchanged:
      allocation_subtenant.py  deallocation_subtenant.py  cleanup_broker_allocation.py
      sandbox_api.py  create_sandbox.py  delete_sandbox.py
      user_provision.py  user_cleanup.py  create_user.py  delete_user.py
      deploy_api_key.py
-
-agent/                  Claude on Amazon Bedrock, driving two MCP servers
-  app.py                Streamlit chat tab (port 8501)
-  bedrock_agent.py      the tool loop
-  mcp_client.py         McpFleet — Infoblox over HTTP, AWS over stdio
-  requirements.txt
 
 terraform/              the Part 3 AWS VPC, test VM and delivery scaffolding
 ```
@@ -59,7 +53,9 @@ LAB_AUTH_MODE=host python3 seed_lab.py          # refuse to run without a host
 python3 verify_lab.py --stage all               # every check, smoke test
 
 python3 pick_bedrock_model.py --list            # every invokable Claude model
-python3 mcp_probe.py                            # transport + live connection test
+bash setup_claude_code.sh                       # install + configure the assistant
+bash setup_claude_code.sh --keys-only           # re-register after a key swap
+claude mcp list                                 # live connection test
 
 python3 teardown_lab.py --dry-run               # list what would be deleted
 python3 teardown_lab.py --reset                 # teardown, then re-seed clean
@@ -103,15 +99,13 @@ python3 teardown_lab.py --reset                 # teardown, then re-seed clean
 | `LAB_REPO_URL` | `https://github.com/zmiszkiewicz/mcp-cloud-clarity-lab.git` | Repo `setup-shell` clones. |
 | `LAB_REPO_REF` | `main` | Branch to clone. Set this to test a branch without editing `setup-shell`. |
 | `LAB_DIR` | `/root/infoblox-lab/mcp-cloud-clarity-lab` | Clone destination. |
-| `BEDROCK_MODEL_ID` | *discovered* | Set by `pick_bedrock_model.py` at setup. Setting it explicitly skips discovery. |
-| `BEDROCK_MODEL_PREFERENCE` | `sonnet` | Family discovery prefers, most preferred first. |
-| `BEDROCK_FALLBACK_MODEL_ID` | `anthropic.claude-sonnet-5` | Used only if discovery cannot run at all. |
-| `MCP_TRANSPORT` | *unset* | Pin `streamable-http` or `sse` once `mcp_probe.py` has told you which. Unset negotiates. |
+| `BEDROCK_PREFERRED_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | The pin. A cross-region inference profile id, not a bare model id. |
+| `BEDROCK_MODEL_ID` | *verified* | Set explicitly to skip verification entirely. |
+| `BEDROCK_MODEL_PREFERENCE` | `sonnet` | Family to fall back to if the pin is not invokable here. |
+| `CLAUDE_PROJECT_DIR` | `/root/techcorp` | Where the participant runs Claude Code. |
 | `BEDROCK_REGION` | `us-east-1` | Bedrock **and** VPC region. Must be in `config.yml` and have model access granted. |
-| `AGENT_KEY_FILE` | `/opt/lab/mcp_key` | The key the assistant re-reads every turn. Rewriting it swaps its permissions live. |
-| `AGENT_PORT` | `8501` | Port the chat tab serves on; must match `config.yml` and the `service` tabs. |
+| `AGENT_KEY_FILE` | `/opt/lab/mcp_key` | The key baked into the MCP registration. Rewrite it, then re-run `setup_claude_code.sh --keys-only`. |
 | `AWS_MCP_ENABLED` | `1` | Set `0` to run Infoblox-only, e.g. when debugging Parts 1/2/4. |
-| `AWS_MCP_ARGS` | `awslabs.aws-api-mcp-server@latest` | The stdio AWS MCP server `uvx` launches. |
 | `LAB_ANSWER_FILE` | `/opt/lab/answer_c1.txt` | Where `lab-answer` records the Part 1 count. |
 | `LAB_MIN_SERVICES` | `10` | Plausibility floor for that count. See TODO-33. |
 | `LAB_DC_RESOLVER` | *unset* | Resolver the Part 2 `dig` probe queries. **TODO-22** — the probe is skipped while unset. |
@@ -248,6 +242,42 @@ that is the higher-fidelity lab and it is one env var away.
 whatever was resolved as the `DNS_SERVER_NAME` agent variable and
 `02/assignment.md` renders it, so the prose always names an object the
 participant can actually find.
+
+## The assistant
+
+Claude Code, in a terminal tab, on Amazon Bedrock. No Anthropic API key and no
+browser login: AWS credentials resolve through the standard chain from
+`/root/.aws/credentials`, which track setup already wrote.
+
+**This replaced a custom Streamlit agent**, and the reason is worth recording.
+That agent spoke MCP through the `mcp` Python package, which meant this lab
+owned an MCP client. The library moved underneath it three times in one
+afternoon — a renamed factory (`streamablehttp_client` → `streamable_http_client`),
+a changed signature (`headers=` → `http_client=`), and a swapped HTTP library
+(`httpx` → `httpx2`). Each cost a track start, and none of it taught a
+participant anything. Claude Code is the vendor-documented client for this
+server and maintains all of that itself.
+
+It also does three things the custom agent had to approximate:
+
+| | Custom agent | Claude Code |
+|---|---|---|
+| Connection view | a sidebar I wrote | `/mcp`, showing real connection state |
+| Write approval | prose asking the participant to review | a real per-tool permission prompt |
+| Model | one hardcoded id | `/model`, and a pinned Bedrock profile |
+
+**The model must be pinned.** Unpinned on Bedrock, Claude Code runs Opus 5 as
+its primary model and resolves the `sonnet` alias to Sonnet 4.5 — so the lab
+would quietly run a different model *and* bill at the Opus rate.
+`pick_bedrock_model.py` confirms the pin is invokable in the account and falls
+back to the newest available Sonnet if not.
+
+**The key handover costs a restart.** The old agent re-read its key file every
+turn, so Part 2's read-only → read/write swap was live. Claude Code bakes the
+auth header into the MCP registration, so `02/setup-shell` rewrites the key,
+re-runs `setup_claude_code.sh --keys-only`, and the assignment tells the
+participant to restart Claude Code. That lands on the challenge boundary, where
+they are switching tabs anyway.
 
 ## Design notes
 

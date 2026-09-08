@@ -100,42 +100,43 @@ TERRAFORM_DIR = os.path.join(LAB_DIR, "terraform")
 
 
 # --------------------------------------------------------------------------- #
-# The agent
+# The assistant
 # --------------------------------------------------------------------------- #
 #
-# Claude runs on Amazon Bedrock in the Instruqt-provided AWS sandbox account and
-# is served to the learner as a chat tab. Bedrock does NOT support the Claude
-# API's `mcp_servers` connector (first-party / Foundry only), so the agent runs
-# its own MCP client and drives the tool loop itself. agent/ has the code.
+# Claude Code, running against Amazon Bedrock in the Instruqt sandbox account.
+# The participant works in a terminal tab; scripts/setup_claude_code.sh installs
+# and configures it.
 #
-# This track connects the agent to TWO MCP servers at once — Infoblox for the
-# DDI side and AWS for the cloud side — which is what makes Part 3's single
-# conversation possible.
+# This replaced a custom Streamlit agent that spoke MCP through the `mcp` Python
+# package. Owning an MCP client meant owning its churn — a renamed factory, a
+# changed signature, a swapped HTTP library — and four track starts died on that
+# without teaching a participant anything. Claude Code is the vendor-documented
+# path for this server and maintains the client itself.
 
-# The model the assistant runs on.
+# The model, as a cross-region inference profile id. Claude Code needs a profile
+# id here; a bare `anthropic.…` fails with an on-demand-throughput error.
 #
-# Normally SET BY DISCOVERY: 01/setup-shell runs pick_bedrock_model.py, which
-# asks Bedrock which Anthropic models this account can actually invoke in this
-# region and exports the newest Sonnet. The value below is only the fallback for
-# when that cannot run.
-#
-# Sonnet rather than Opus deliberately. This track's work is tool-calling
-# against two MCP servers with short reasoning hops between calls — Sonnet is
-# well suited to that and noticeably faster to first token, which matters when a
-# participant is watching a Part 3 deployment run a dozen calls.
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-sonnet-5")
-
-# Which family discovery should prefer. Comma-separated, most preferred first.
+# Pinned rather than defaulted: Claude Code on Bedrock defaults its primary
+# model to Opus 5 and its `sonnet` alias to Sonnet 4.5, so an unpinned lab runs
+# a different model than intended AND is billed at the Opus rate.
+# pick_bedrock_model.py confirms the account can invoke this and falls back
+# sensibly if not.
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID",
+                                  "us.anthropic.claude-sonnet-4-6")
 BEDROCK_MODEL_PREFERENCE = os.environ.get("BEDROCK_MODEL_PREFERENCE", "sonnet")
 AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
-# The agent reads its Infoblox Service API key from this file on EVERY turn,
-# rather than capturing it at boot. That is what makes the read-only ->
-# read/write handover at Part 2 real: 02/setup-shell rewrites this file with the
-# read/write key and 04/setup-shell writes the read-only key back, and the agent
-# picks the change up on the next message with no restart.
+# Where the participant runs Claude Code. Its own directory, not the lab's
+# scripts directory — an assistant should not open onto the machinery that
+# built its environment.
+CLAUDE_PROJECT_DIR = os.environ.get("CLAUDE_PROJECT_DIR", "/root/techcorp")
+
+# The Infoblox Service API key currently in force. setup_claude_code.sh reads
+# this file and bakes it into the MCP server registration, so rewriting the file
+# and re-running that script with --keys-only is how Part 2 hands over write
+# access. Unlike the old per-turn agent, this needs Claude Code restarted — the
+# challenge boundary is where that happens.
 AGENT_KEY_FILE = os.environ.get("AGENT_KEY_FILE", "/opt/lab/mcp_key")
-AGENT_PORT = int(os.environ.get("AGENT_PORT", "8501"))
 
 # Where the `lab-answer` helper records the number the participant reads off the
 # Part 1 connection check. Instruqt has no native free-text answer field on a
@@ -143,23 +144,12 @@ AGENT_PORT = int(os.environ.get("AGENT_PORT", "8501"))
 ANSWER_FILE = os.environ.get("LAB_ANSWER_FILE", "/opt/lab/answer_c1.txt")
 
 # A healthy MCP connection returns a service catalog with dozens of entries; a
-# broken one returns nothing or a handful. Anything at or above this is treated
-# as "you were looking at a real catalog". See TODO-33 for why this is a band
+# broken one returns nothing or a handful. See TODO-33 for why this is a band
 # rather than an exact comparison.
 MIN_PLAUSIBLE_SERVICE_COUNT = int(os.environ.get("LAB_MIN_SERVICES", "10"))
 
-# The AWS MCP server the agent runs alongside Infoblox for Part 3. Stdio, run
-# through uvx, so there is nothing to host and no second port to expose. It
-# picks up credentials from the standard boto3 chain — track_scripts/setup-shell
-# writes them to /root/.aws/credentials.
+# The AWS MCP server Claude Code runs alongside Infoblox for Part 3.
 AWS_MCP_ENABLED = os.environ.get("AWS_MCP_ENABLED", "1") not in ("0", "false", "")
-AWS_MCP_COMMAND = os.environ.get("AWS_MCP_COMMAND", "uvx")
-AWS_MCP_ARGS = [
-    a for a in os.environ.get(
-        "AWS_MCP_ARGS", "awslabs.aws-api-mcp-server@latest"
-    ).split()
-    if a
-]
 
 # CSP groups assigned to each MCP user.
 #

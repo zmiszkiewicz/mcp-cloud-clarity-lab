@@ -35,15 +35,23 @@ import re
 import sys
 
 
-# Families in preference order. Substring match against the model id, so
-# "sonnet" matches whatever the newest Sonnet happens to be called.
+# What we want, unless the account cannot invoke it. The `us.` prefix is the
+# cross-region inference profile — Claude Code needs a profile id here, not a
+# bare `anthropic.…` model id, which fails with an on-demand-throughput error.
+#
+# Pinned rather than left to discovery because Claude Code's own default on
+# Bedrock is Opus 5 for the primary model and Sonnet 4.5 for the `sonnet` alias.
+# Unpinned, this lab would silently run a different model at a higher rate.
+PREFERRED_MODEL_ID = os.environ.get(
+    "BEDROCK_PREFERRED_MODEL_ID", "us.anthropic.claude-sonnet-4-6"
+)
+
+# Family to fall back to if the preferred id is not invokable here.
 DEFAULT_PREFERENCE = os.environ.get("BEDROCK_MODEL_PREFERENCE", "sonnet")
 
-# Used only when discovery cannot run at all (no credentials, no bedrock
-# permission). Deliberately a Sonnet: this track's work is tool-calling against
-# two MCP servers, which Sonnet handles well and faster than a larger model.
+# Last resort when Bedrock cannot be queried at all.
 FALLBACK_MODEL_ID = os.environ.get(
-    "BEDROCK_FALLBACK_MODEL_ID", "anthropic.claude-sonnet-5"
+    "BEDROCK_FALLBACK_MODEL_ID", PREFERRED_MODEL_ID
 )
 
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -54,22 +62,32 @@ def _client(service):
     return boto3.client(service, region_name=REGION)
 
 
-def _date_key(model_id):
+def _version_key(model_id):
     """
     Sort key that puts the newest model first.
 
-    Anthropic Bedrock ids carry a date (`...-20250929-v1:0`) often enough to be
-    the most reliable ordering signal. Where there is no date, fall back to the
-    trailing version digits, then to the string itself so the order is at least
-    stable.
+    Ordering these by the embedded DATE is wrong, and wrong in a way that picks
+    the older model: `claude-sonnet-4-5-20250929-v1:0` carries a date while
+    `claude-sonnet-4-6` does not, so a date-first comparison ranks 4.5 above
+    4.6. The family version is the real signal; the date only breaks ties
+    within one version.
+
+    So: strip the date and the `-vN` suffix, read the major/minor pair out of
+    what remains, and use the date afterwards.
     """
-    date = re.search(r"(20\d{6})", model_id)
-    version = re.search(r"-v(\d+)", model_id)
-    return (
-        int(date.group(1)) if date else 0,
-        int(version.group(1)) if version else 0,
-        model_id,
-    )
+    tail = model_id.split("anthropic.")[-1]
+
+    date = re.search(r"(20\d{6})", tail)
+    stripped = re.sub(r"20\d{6}", "", re.sub(r"-v\d+.*$", "", tail))
+
+    pair = re.search(r"-(\d+)-(\d+)", stripped)
+    if pair:
+        major, minor = int(pair.group(1)), int(pair.group(2))
+    else:
+        single = re.search(r"-(\d+)\b", stripped)
+        major, minor = (int(single.group(1)), 0) if single else (0, 0)
+
+    return (major, minor, int(date.group(1)) if date else 0, model_id)
 
 
 def available_models():
@@ -122,32 +140,42 @@ def available_models():
 
 
 def choose(preference=None):
-    """The best available model id, and a one-line explanation."""
+    """
+    The model id to pin, and a one-line explanation.
+
+    Verify-then-fall-back, rather than pure discovery: we know which model this
+    lab wants, so the job is confirming the account can invoke it and choosing
+    sensibly when it cannot.
+    """
     explicit = os.environ.get("BEDROCK_MODEL_ID")
     if explicit:
-        return explicit, f"BEDROCK_MODEL_ID is set explicitly"
-
-    preference = [p.strip().lower() for p in
-                  (preference or DEFAULT_PREFERENCE).split(",") if p.strip()]
+        return explicit, "BEDROCK_MODEL_ID is set explicitly"
 
     try:
         usable = available_models()
     except Exception as exc:                            # noqa: BLE001
-        return FALLBACK_MODEL_ID, f"discovery failed ({exc}); using the fallback"
+        return FALLBACK_MODEL_ID, f"could not query Bedrock ({exc}); using the pin unverified"
 
     if not usable:
-        return FALLBACK_MODEL_ID, "no invokable Anthropic models found; using the fallback"
+        return FALLBACK_MODEL_ID, "no invokable Anthropic models found; using the pin unverified"
 
+    ids = [invoke_id for invoke_id, _ in usable]
+
+    if PREFERRED_MODEL_ID in ids:
+        return PREFERRED_MODEL_ID, f"preferred model is invokable in {REGION}"
+
+    preference = [p.strip().lower() for p in
+                  (preference or DEFAULT_PREFERENCE).split(",") if p.strip()]
     for family in preference:
-        matches = [invoke_id for invoke_id, _ in usable
-                   if family in invoke_id.lower()]
+        matches = [i for i in ids if family in i.lower()]
         if matches:
-            best = sorted(matches, key=_date_key, reverse=True)[0]
-            return best, f"newest '{family}' model invokable in {REGION}"
+            best = sorted(matches, key=_version_key, reverse=True)[0]
+            return best, (f"{PREFERRED_MODEL_ID} is not invokable here; using "
+                          f"the newest '{family}' instead")
 
-    best = sorted((i for i, _ in usable), key=_date_key, reverse=True)[0]
-    return best, (f"no model matched {preference}; using the newest Anthropic "
-                  f"model available")
+    best = sorted(ids, key=_version_key, reverse=True)[0]
+    return best, (f"neither {PREFERRED_MODEL_ID} nor {preference} is available; "
+                  f"using the newest Anthropic model in the account")
 
 
 def main():
@@ -165,7 +193,7 @@ def main():
             print(f"❌ {exc}", file=sys.stderr)
             return 1
         print(f"Anthropic models invokable in {REGION}:\n")
-        for invoke_id, summary in sorted(usable, key=lambda p: _date_key(p[0]),
+        for invoke_id, summary in sorted(usable, key=lambda p: _version_key(p[0]),
                                          reverse=True):
             via = "" if invoke_id == summary["modelId"] else "  (via inference profile)"
             print(f"  {invoke_id}{via}")
