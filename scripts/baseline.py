@@ -425,13 +425,16 @@ def ensure_reserved_block(client, space_id):
     return created
 
 
-def ensure_dhcp_range(client, space_id, subnet_id, bounds=None):
+def ensure_dhcp_range(client, space_id, bounds=None):
     """
     The Branch-02 DHCP range. Seeded healthy (.100-.200); Part 4's break narrows
     it onto the reserved addresses.
 
-    A range hangs off the IP space via `space` and off its subnet via `parent` —
-    there is no `subnet` field.
+    A range hangs off the IP space via `space`. It also has a `parent` naming
+    its subnet, but that field is READ-ONLY on the live API — same story as
+    fixed_address, and same disagreement with the OpenAPI client, which
+    documents it as writable. CSP derives the parent from `space` plus the
+    range bounds, so 10.30.2.100-.200 lands under Branch-02 on its own.
     """
     bounds = bounds or cfg.BRANCH_RANGE_HEALTHY
     existing = client.find_by_name(cfg.path("dhcp_range"), bounds["name"])
@@ -443,7 +446,6 @@ def ensure_dhcp_range(client, space_id, subnet_id, bounds=None):
         "start": bounds["start"],
         "end": bounds["end"],
         "space": space_id,
-        "parent": subnet_id,
         "name": bounds["name"],
         "comment": "Branch-02 client pool",
         "tags": LAB_TAGS,
@@ -490,7 +492,7 @@ def build_all(client):
     subnets = ensure_subnets(client, space["id"])
     branch = subnets["branch-02"]
     ensure_reserved_block(client, space["id"])
-    dhcp_range = ensure_dhcp_range(client, space["id"], branch["id"])
+    dhcp_range = ensure_dhcp_range(client, space["id"])
 
     return {
         "view_id": view["id"],
