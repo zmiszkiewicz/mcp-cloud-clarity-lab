@@ -148,6 +148,12 @@ SETTINGS
 
   # A working directory of its own, so Claude Code has a project to sit in and
   # the participant is not running an agent from inside the lab's own scripts.
+  #
+  # Written TWICE, deliberately. The project copy is what a participant would
+  # expect; the user-level copy at ~/.claude/CLAUDE.md applies from any
+  # directory, so the assistant still behaves correctly if someone starts it
+  # from the wrong tab. Project context is a nice-to-have; the write-safety
+  # instruction is not.
   cat > "${PROJECT_DIR}/CLAUDE.md" <<'PROJECT'
 # TechCorp network operations
 
@@ -174,6 +180,7 @@ When a call is refused, say so directly and explain which credential was used
 and what role it would need. Do not retry a denied write or work around it — an
 access denial is information, not an obstacle.
 PROJECT
+  cp "${PROJECT_DIR}/CLAUDE.md" /root/.claude/CLAUDE.md
 fi
 
 # --------------------------------------------------------------------------- #

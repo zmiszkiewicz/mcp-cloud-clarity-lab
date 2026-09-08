@@ -334,3 +334,14 @@ Two rules are enforced across every lifecycle script here:
 A related trap in the same family: `rc=$?` inside `if ! cmd; then` captures the
 status of the negation, not the command — it is always 0, which produces a
 cheerful "failed (exit 0)". Use `cmd; rc=$?` instead.
+
+### And the third face of it: `set-workdir` beats a tab's `workdir`
+
+Because `set-workdir` writes its `cd` into `/root/.bashrc`, it applies to
+*every* terminal on the host and overrides the `workdir` a tab declares. The
+Assistant tab asked for `/root/techcorp` and opened in the lab's scripts
+directory instead.
+
+**Do not call `set-workdir` in this track.** Every terminal tab declares its own
+`workdir`, which is the mechanism that belongs here. The one global setting was
+quietly beating four specific ones.
