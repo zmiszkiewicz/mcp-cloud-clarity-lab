@@ -1,0 +1,19 @@
+# State files written at runtime by the lifecycle scripts. NEVER commit these —
+# mcp_ro_key.txt and mcp_rw_key.txt are live credentials against a real tenant.
+scripts/*.txt
+scripts/seed_ids.json
+scripts/vpc_outputs.json
+scripts/sandbox_env.sh
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+terraform/crash.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
