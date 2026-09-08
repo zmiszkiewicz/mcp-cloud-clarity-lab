@@ -43,6 +43,9 @@ DELETE_ORDER = [
     ("ipam_ip_space",       "IPAM IP spaces"),
     ("dns_forward_zone",    "forward zones"),
     ("dns_auth_zone",       "authoritative zones"),
+    # Created by the lab in nsg mode, so the lab removes it. Tagged, like
+    # everything else, so a group the tenant already had is left alone.
+    ("dns_auth_nsg",        "DNS server groups"),
     ("dns_view",            "DNS views"),
 ]
 
@@ -60,14 +63,18 @@ def release_host_first(client, ids):
     Deleting a zone that a host is still serving either fails or leaves the host
     reconciling state the next seeding has to undo. Doing it explicitly costs
     one PATCH and saves debugging it later. The host itself is never deleted —
-    the lab did not create it.
+    the lab did not create it. A lab-created DNS server group IS deleted, by the
+    tag-filtered purge below.
     """
     zone_id = ids.get("zone_id")
     if not zone_id:
         return
     try:
+        # Both representations: we do not know which one this run used, and
+        # clearing the wrong one leaves the zone pinned to an object we are
+        # about to delete.
         client.patch(cfg.path("dns_auth_zone") + f"/{zone_id}",
-                     json_body={"internal_secondaries": []})
+                     json_body={"internal_secondaries": [], "nsgs": []})
         info(f"released {cfg.ZONE_FQDN} from its authoritative servers")
     except (CspError, LabTodo) as exc:
         info(f"could not release the zone from its host (continuing): {exc}")

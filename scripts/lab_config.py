@@ -254,12 +254,38 @@ BASELINE_CNAME_RECORDS = {
     "api": {"target": APP_FQDN, "comment": "Alias for the payments API"},
 }
 
-# [DNS SERVER] — the Universal DDI host serving the data-centre network. Part 2's
-# break removes it from the zone's Authoritative DNS Servers list.
+# [DNS SERVER] — what Part 2's break removes from the zone's Authoritative DNS
+# Servers list. Which OBJECT that is depends on what the sandbox actually has.
 #
-# Not created by this lab: the host is part of the sandbox the broker hands over.
-# find_dc_host() discovers it if the configured name does not match.
+# AUTH_MODE picks between two ways of expressing "this thing is authoritative
+# for this zone", both of which the Infoblox Portal renders in the same place on
+# a zone's edit page:
+#
+#   host   A Universal DDI host, via the zone's `internal_secondaries`. The
+#          higher-fidelity option: a real server really does answer, so the
+#          NXDOMAIN in the ticket is a genuine query result rather than a
+#          described one. Requires the sandbox to HAVE a registered host.
+#
+#   nsg    A DNS Server Group, via the zone's `nsgs`. An AuthNSG needs only a
+#          name to exist, so the lab can create it and no host is required.
+#          The configuration fault is identical and the participant's
+#          conversation is nearly identical — what is lost is that nothing
+#          actually serves the zone, so there is no live NXDOMAIN to dig for.
+#
+#   auto   Use a host if the tenant has one, otherwise fall back to a server
+#          group. The default, because a broker-allocated sandbox turns out not
+#          to ship with a host and a lab that refuses to start is worse than one
+#          that starts slightly less vividly.
+#
+# resolve_dns_authority() logs which one it picked and why.
+AUTH_MODE = os.environ.get("LAB_AUTH_MODE", "auto")
+
+# Used when AUTH_MODE resolves to `host`. Not created by this lab.
 DC_HOST_NAME = os.environ.get("LAB_DC_HOST", "niosx-dc-01")
+
+# Used when AUTH_MODE resolves to `nsg`. Created by the lab, and torn down.
+DNS_SERVER_GROUP_NAME = os.environ.get("LAB_DNS_SERVER_GROUP",
+                                       "techcorp-dc-servers")
 
 # IPAM.
 IP_SPACE_NAME = os.environ.get("LAB_IP_SPACE", "techcorp-ipam")
@@ -404,6 +430,12 @@ PATHS = {
     "dns_auth_zone":     "/api/ddi/v1/dns/auth_zone",
     "dns_forward_zone":  "/api/ddi/v1/dns/forward_zone",
     "zone_child":        "/api/ddi/v1/dns/zone_child",
+
+    # DNS Server Group. The host-free way to express "these servers are
+    # authoritative for this zone": an AuthNSG needs only a `name` to exist, and
+    # an AuthZone references a list of them in `nsgs`. See AUTH_MODE below for
+    # why that matters.
+    "dns_auth_nsg":      "/api/ddi/v1/dns/auth_nsg",
 
     # The DNS config profile IS the Server object — in Universal DDI there is no
     # separate "config profile" resource.

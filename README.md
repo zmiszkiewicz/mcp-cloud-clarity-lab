@@ -51,6 +51,9 @@ python3 seed_lab.py --assert-only               # verify, change nothing
 python3 seed_lab.py --fix zone_missing_auth_server
 python3 seed_lab.py --list                      # the break registry
 
+LAB_AUTH_MODE=nsg  python3 seed_lab.py          # force the host-free variant
+LAB_AUTH_MODE=host python3 seed_lab.py          # refuse to run without a host
+
 python3 verify_lab.py --stage all               # every check, smoke test
 
 python3 teardown_lab.py --dry-run               # list what would be deleted
@@ -70,7 +73,8 @@ python3 teardown_lab.py --reset                 # teardown, then re-seed clean
 | `MCP_RO_GROUPS` | no | Comma-separated groups for the read-only MCP user. Default `user,ib-mcp-server-user,ib-ddi-user`. |
 | `MCP_RW_GROUPS` | no | Comma-separated groups for the read/write MCP user. Default `user,ib-mcp-server-admin,ib-ddi-admin`. |
 | `MCP_RO_GROUP` / `MCP_RW_GROUP` | no | Single-name overrides replacing just the `ib-mcp-server-*` entry. |
-| `LAB_DC_HOST` | recommended | The Universal DDI host name. See "Group membership and the host name" below. |
+| `LAB_DC_HOST` | optional | Universal DDI host name, used only when `LAB_AUTH_MODE` resolves to `host`. |
+| `LAB_AUTH_MODE` | optional | `auto` (default), `host`, or `nsg`. See "What is authoritative for the zone" below. |
 
 ### Supplied by the Instruqt platform
 
@@ -114,7 +118,10 @@ appears in any assignment.
 | `LAB_DNS_VIEW` | `techcorp-view` | |
 | `LAB_ZONE_FQDN` | `svc.techcorp.internal.` | `[ZONE NAME]` |
 | `LAB_APP_LABEL` | `payments` | (gives `[RECORD]` `payments.svc.techcorp.internal`) |
-| `LAB_DC_HOST` | `niosx-dc-01` | `[DNS SERVER]` |
+| `LAB_AUTH_MODE` | `auto` | picks `host` or `nsg` — see below |
+| `LAB_DC_HOST` | `niosx-dc-01` | `[DNS SERVER]`, in `host` mode |
+| `LAB_DNS_SERVER_GROUP` | `techcorp-dc-servers` | `[DNS SERVER]`, in `nsg` mode |
+| `MCP_KEY_TTL_HOURS` | `24` | lifetime of a minted Service API key |
 | `LAB_IP_SPACE` | `techcorp-ipam` | |
 | `LAB_ADDRESS_BLOCK_ADDR` / `_CIDR` | `10.30.0.0` / `16` | |
 | DC-01 subnet | `10.30.1.0/24` | `[NETWORK]` |
@@ -200,13 +207,39 @@ problem. The matching `ib-ddi-*` role is what makes the data visible.
 make Part 4's RBAC exercise meaningless, and `check_c4` probes for exactly that
 and fails the lab loudly if it finds it.
 
-### `LAB_DC_HOST` should be pinned
+### What is authoritative for the zone
 
-`baseline.find_dc_host()` auto-selects when the tenant has exactly one Universal
-DDI host, and logs what it picked. That keeps a track start from failing — but
-`02/assignment.md` names `niosx-dc-01` in prose, so a discovered host with a
-different name makes the assignment read wrong to the participant. Pin it as a
-secret once the sandbox image is settled.
+**A broker-allocated sandbox ships with no Universal DDI host.** Confirmed on a
+live run: `/dns/host`, `/infra/hosts` and `/infra/services` all come back empty.
+Part 2's whole fault is "the DNS server is not on the zone's Authoritative DNS
+Servers list", which needs *something* to be that server.
+
+`LAB_AUTH_MODE` picks what:
+
+| Mode | Object | Zone field | Needs a host? |
+|---|---|---|---|
+| `host` | a Universal DDI host | `internal_secondaries` | yes |
+| `nsg` | a DNS Server Group | `nsgs` | no — an AuthNSG needs only a name |
+| `auto` | host if one exists, else server group | either | no |
+
+Both fields are what the Portal renders under "Authoritative DNS Servers" on a
+zone's edit page, so the participant's experience is nearly identical and
+`authoritative_server_ids()` reads both regardless of mode — someone who fixes
+it in the Portal gets credit for whichever kind the UI offered them.
+
+**What `nsg` mode costs.** Nothing actually serves the zone, so there is no live
+NXDOMAIN to `dig` for. The fault is a real, Portal-visible configuration error
+and the diagnosis conversation is the same, but the participant is reasoning
+about configuration rather than observing a symptom. `02/assignment.md` says so
+plainly rather than promising a `dig` result that will not come.
+
+Switch to `host` mode the moment the sandbox image ships a registered host —
+that is the higher-fidelity lab and it is one env var away.
+
+**The assignment does not hardcode either name.** `01/setup-shell` publishes
+whatever was resolved as the `DNS_SERVER_NAME` agent variable and
+`02/assignment.md` renders it, so the prose always names an object the
+participant can actually find.
 
 ## Design notes
 

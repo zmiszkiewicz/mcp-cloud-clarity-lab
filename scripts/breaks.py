@@ -49,15 +49,35 @@ def break_zone_missing_auth_server(client, ids):
     idea it is supposed to answer for that name and returns NXDOMAIN like any
     server asked about a zone it does not host.
 
-    In the API this is `internal_secondaries` on the auth zone; in the Portal it
-    is the "Authoritative DNS Servers" list on the zone's edit page. Same field,
-    so a participant who fixes this in the Portal instead of through the agent
+    In the API this is `internal_secondaries` (a host) or `nsgs` (a DNS server
+    group) on the auth zone; in the Portal both are the "Authoritative DNS
+    Servers" list on the zone's edit page. Same field either way, so a
+    participant who fixes this in the Portal instead of through the assistant
     still passes the check.
     """
-    client.patch(cfg.path("dns_auth_zone") + f"/{ids['zone_id']}", json_body={
-        "internal_secondaries": [],
-    })
+    import baseline
+
+    baseline.set_authoritative_servers(client, ids["zone_id"], _authority(ids),
+                                       attached=False)
     ok(f"break applied: {cfg.ZONE_FQDN} has no authoritative DNS servers")
+
+
+def _authority(ids):
+    """
+    The authority descriptor seed_lab recorded.
+
+    Falls back to reconstructing it from the flattened fields so a seed_ids.json
+    written by an older build still loads rather than KeyError-ing halfway
+    through a track.
+    """
+    if ids.get("authority"):
+        return ids["authority"]
+    return {
+        "mode": ids.get("auth_mode", "host"),
+        "id": ids.get("dns_server_id") or ids.get("dc_host_id"),
+        "name": ids.get("dns_server_name") or ids.get("dc_host_name")
+                or cfg.DC_HOST_NAME,
+    }
 
 
 def assert_zone_missing_auth_server(client, ids):
@@ -71,7 +91,7 @@ def assert_zone_missing_auth_server(client, ids):
         )
     return True, (
         f"{cfg.ZONE_FQDN} has an empty Authoritative DNS Servers list — "
-        f"{ids.get('dc_host_name', cfg.DC_HOST_NAME)} will return NXDOMAIN"
+        f"{_authority(ids)['name']} is not serving it"
     )
 
 
@@ -79,9 +99,11 @@ def fix_zone_missing_auth_server(client, ids):
     """The remediation, for solve-shell and for reset between runs."""
     import baseline
 
-    baseline.set_authoritative_servers(client, ids["zone_id"], [ids["dc_host_id"]])
-    ok(f"added {ids.get('dc_host_name', cfg.DC_HOST_NAME)} back to the "
-       f"authoritative servers for {cfg.ZONE_FQDN}")
+    authority = _authority(ids)
+    baseline.set_authoritative_servers(client, ids["zone_id"], authority,
+                                       attached=True)
+    ok(f"added {authority['name']} back to the authoritative servers for "
+       f"{cfg.ZONE_FQDN}")
 
 
 # --------------------------------------------------------------------------- #

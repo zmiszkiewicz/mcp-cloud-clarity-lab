@@ -184,7 +184,8 @@ def main():
     print(f"\n{'=' * 62}", flush=True)
     print("🎉 Tenant seeded and every break asserted. The lab is ready.", flush=True)
     print(f"   Zone:        {cfg.ZONE_FQDN}", flush=True)
-    print(f"   DNS server:  {ids.get('dc_host_name', cfg.DC_HOST_NAME)}", flush=True)
+    print(f"   DNS server:  {ids.get('dns_server_name', '?')} "
+          f"({ids.get('auth_mode', '?')} mode)", flush=True)
     print(f"   Network:     {cfg.SUBNETS['dc-01']['address']}"
           f"/{cfg.SUBNETS['dc-01']['cidr']}", flush=True)
     print(f"   Branch:      {cfg.SUBNETS['branch-02']['address']}"

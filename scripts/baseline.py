@@ -118,87 +118,198 @@ def _ensure_record(client, zone_id, name_in_zone, rtype, rdata, comment):
     return created.get("result", created)
 
 
-def find_dc_host(client):
+def inventory(client):
     """
-    The Universal DDI host serving the data-centre network — [DNS SERVER] in the
-    track flow, and the host Part 2's break removes from the zone.
+    What this tenant actually contains, as far as DNS authority is concerned.
 
-    Not created here: the host is part of the sandbox the broker hands us. We
-    try the configured name first, then auto-discover — if exactly one host
-    exists in the tenant it is unambiguously the one, so we use it and log the
-    name so the operator can pin LAB_DC_HOST for future runs.
+    Exists because "no DNS hosts" and "no hosts" are different statements and
+    the first was being reported as the second. `/dns/host` lists only hosts
+    with a DNS view of themselves; a host registered in the infrastructure but
+    with no DNS service on it does not appear there. Telling an operator "no
+    hosts at all" when three are registered would send them to debug the wrong
+    thing.
+    """
+    def safe(key):
+        try:
+            return client.list_results(cfg.path(key))
+        except Exception as exc:                        # noqa: BLE001
+            info(f"could not list {key}: {exc}")
+            return []
 
-    Zero hosts, or several with no name match, is a hard failure. There is no
-    safe way to guess which host should be authoritative for the zone, and
-    guessing wrong produces a lab where the break is real but the fix the
+    return {
+        "dns_host": safe("dns_host"),
+        "infra_hosts": safe("infra_hosts"),
+        "infra_services": safe("infra_services"),
+        "dns_auth_nsg": safe("dns_auth_nsg"),
+    }
+
+
+def _describe_inventory(data):
+    def names(rows):
+        return [r.get("name") or r.get("absolute_name") or r.get("display_name")
+                or "<unnamed>" for r in rows] or ["(none)"]
+
+    return (
+        f"   DNS hosts (/dns/host):        {', '.join(names(data['dns_host']))}\n"
+        f"   Infra hosts (/infra/hosts):   {', '.join(names(data['infra_hosts']))}\n"
+        f"   Services (/infra/services):   {', '.join(names(data['infra_services']))}\n"
+        f"   Server groups (/auth_nsg):    {', '.join(names(data['dns_auth_nsg']))}\n"
+    )
+
+
+def find_dc_host(client, data=None):
+    """
+    The Universal DDI host serving the data-centre network, or None.
+
+    Not created here: a host is part of the sandbox, if the sandbox has one.
+    Tries the configured name first, then auto-selects when exactly one host
+    exists. Several hosts with no name match returns None rather than guessing —
+    picking the wrong one produces a lab where the break is real but the fix the
     participant is told to make is the wrong one.
     """
-    host = (client.find_by_name(cfg.path("dns_host"), cfg.DC_HOST_NAME)
-            or client.find_by_name(cfg.path("dns_host"), cfg.DC_HOST_NAME,
-                                   field="absolute_name"))
-    if host:
-        return host
+    hosts = (data or {}).get("dns_host")
+    if hosts is None:
+        hosts = client.list_results(cfg.path("dns_host"))
 
-    all_hosts = client.list_results(cfg.path("dns_host"))
-    if len(all_hosts) == 1:
-        host = all_hosts[0]
+    for field in ("name", "absolute_name"):
+        match = next((h for h in hosts if h.get(field) == cfg.DC_HOST_NAME), None)
+        if match:
+            return match
+
+    if len(hosts) == 1:
+        host = hosts[0]
         discovered = host.get("name") or host.get("absolute_name", "<unnamed>")
         print(
             f"⚠️  LAB_DC_HOST={cfg.DC_HOST_NAME!r} not matched; auto-selected "
             f"the only host in this tenant: {discovered!r}.\n"
-            f"   Pin it for future runs: export LAB_DC_HOST={discovered!r}\n"
-            f"   NOTE: the assignment prose names {cfg.DC_HOST_NAME!r}. If the "
-            f"discovered name differs, 02/assignment.md reads wrong to the "
-            f"participant — set LAB_DC_HOST as an Instruqt secret instead.",
+            f"   Pin it for future runs by setting LAB_DC_HOST={discovered!r}.",
             flush=True,
         )
         return host
 
-    names = [h.get("name") or h.get("absolute_name", "<unnamed>") for h in all_hosts]
-    if all_hosts:
+    if hosts:
+        names = [h.get("name") or h.get("absolute_name", "<unnamed>") for h in hosts]
+        print(f"⚠️  LAB_DC_HOST={cfg.DC_HOST_NAME!r} not found and there are "
+              f"{len(hosts)} hosts — refusing to guess. Set LAB_DC_HOST to one "
+              f"of: {', '.join(names)}", flush=True)
+    return None
+
+
+def ensure_dns_server_group(client):
+    """
+    The DNS Server Group that stands in for the data-centre servers.
+
+    An AuthNSG requires only a `name`, which is the whole reason this path
+    exists: it gives the track a real, Portal-visible object to make
+    authoritative for the zone without needing a registered host.
+    """
+    existing = client.find_by_name(cfg.path("dns_auth_nsg"),
+                                   cfg.DNS_SERVER_GROUP_NAME)
+    if existing:
+        info(f"DNS server group {cfg.DNS_SERVER_GROUP_NAME} already present")
+        return existing
+
+    created = client.post(cfg.path("dns_auth_nsg"), json_body={
+        "name": cfg.DNS_SERVER_GROUP_NAME,
+        "comment": "Data centre authoritative DNS servers",
+        "tags": LAB_TAGS,
+    })
+    ok(f"created DNS server group {cfg.DNS_SERVER_GROUP_NAME}")
+    return created.get("result", created)
+
+
+def resolve_dns_authority(client):
+    """
+    Decide WHAT gets made authoritative for the zone, and return a descriptor:
+
+        {"mode": "host"|"nsg", "id": <resource id>, "name": <display name>}
+
+    Honours LAB_AUTH_MODE. In `auto` — the default — a registered host wins
+    because it is the higher-fidelity story, and a server group is the fallback
+    when the tenant has none.
+
+    A hard failure here only happens when the operator explicitly asked for
+    `host` and there is none. Failing a track start on a missing host when a
+    perfectly good host-free path exists would be a bad trade.
+    """
+    mode = cfg.AUTH_MODE
+    if mode not in ("auto", "host", "nsg"):
         raise SystemExit(
-            f"❌ LAB_DC_HOST={cfg.DC_HOST_NAME!r} not found and there are "
-            f"{len(all_hosts)} hosts — cannot auto-select.\n"
-            f"   Set LAB_DC_HOST to one of: {', '.join(names)}"
+            f"❌ LAB_AUTH_MODE={mode!r} is not one of auto, host, nsg."
         )
-    raise SystemExit(
-        f"❌ No DNS hosts found in this tenant at all.\n"
-        f"   The broker sandbox must have at least one Universal DDI host "
-        f"registered before this track can seed.\n"
-        f"   Check that allocation_subtenant.py succeeded and the sandbox is "
-        f"healthy."
-    )
+
+    data = inventory(client)
+    print("── tenant inventory ──\n" + _describe_inventory(data), flush=True)
+
+    if mode in ("auto", "host"):
+        host = find_dc_host(client, data)
+        if host:
+            name = host.get("name") or host.get("absolute_name")
+            ok(f"DNS authority: host {name} (LAB_AUTH_MODE={mode})")
+            return {"mode": "host", "id": host["id"], "name": name}
+
+        if mode == "host":
+            raise SystemExit(
+                "❌ LAB_AUTH_MODE=host was requested but this tenant has no "
+                "usable Universal DDI host.\n"
+                + _describe_inventory(data)
+                + "   Either register a host in the sandbox, pin LAB_DC_HOST to "
+                  "one of the names above, or use LAB_AUTH_MODE=nsg / auto to "
+                  "run the host-free variant."
+            )
+
+        print("ℹ️  No Universal DDI host in this tenant — falling back to a DNS "
+              "server group. The configuration fault is identical; what is lost "
+              "is a server that genuinely answers, so there is no live NXDOMAIN "
+              "to dig for. Set LAB_AUTH_MODE=host once the sandbox ships a "
+              "host.", flush=True)
+
+    group = ensure_dns_server_group(client)
+    ok(f"DNS authority: server group {cfg.DNS_SERVER_GROUP_NAME} "
+       f"(LAB_AUTH_MODE={mode})")
+    return {"mode": "nsg", "id": group["id"],
+            "name": cfg.DNS_SERVER_GROUP_NAME}
 
 
-def set_authoritative_servers(client, zone_id, host_ids):
+def set_authoritative_servers(client, zone_id, authority, attached=True):
     """
     Write the zone's Authoritative DNS Servers list.
 
-    `internal_secondaries` is the API name for the list the Infoblox Portal
-    labels "Authoritative DNS Servers" on an auth zone. Each entry is
-    {"host": "<dns/host resource id>"}. The field is a plain PATCH, which is
-    what makes Part 2 work end to end: the participant can add the host through
-    the agent or through the Portal, and check_c2() reads the same field either
-    way.
+    Both fields below are what the Infoblox Portal renders under "Authoritative
+    DNS Servers" on a zone's edit page — `internal_secondaries` for hosts,
+    `nsgs` for server groups. Both are plain PATCHes, which is what makes Part 2
+    work end to end: the participant can fix it through the assistant or through
+    the Portal, and check_c2() reads back the same field either way.
 
-    Passing an empty list is the break; passing [dc_host] is the healthy state
-    and the fix.
+    `attached=False` is the break; True is the healthy state and the fix.
     """
-    client.patch(cfg.path("dns_auth_zone") + f"/{zone_id}", json_body={
-        "internal_secondaries": [{"host": host_id} for host_id in host_ids],
-    })
-    return host_ids
+    if authority["mode"] == "host":
+        body = {"internal_secondaries":
+                [{"host": authority["id"]}] if attached else []}
+    else:
+        body = {"nsgs": [authority["id"]] if attached else []}
+
+    client.patch(cfg.path("dns_auth_zone") + f"/{zone_id}", json_body=body)
+    return body
 
 
 def authoritative_server_ids(client, zone_id):
-    """The host ids currently on the zone's Authoritative DNS Servers list."""
+    """
+    Everything currently on the zone's Authoritative DNS Servers list, in both
+    representations, as a flat list of resource ids.
+
+    Reads both regardless of mode on purpose. A participant who fixes this in
+    the Portal might well add whichever kind the UI offered them, and the check
+    should credit that rather than insisting on the one the seeder used.
+    """
     zone = client.get(cfg.path("dns_auth_zone") + f"/{zone_id}")
     zone = zone.get("result", zone)
-    return [
-        entry.get("host")
-        for entry in (zone.get("internal_secondaries") or [])
-        if entry.get("host")
-    ]
+
+    ids = [entry.get("host")
+           for entry in (zone.get("internal_secondaries") or [])
+           if entry.get("host")]
+    ids += [nsg for nsg in (zone.get("nsgs") or []) if nsg]
+    return ids
 
 
 # --------------------------------------------------------------------------- #
@@ -362,13 +473,12 @@ def build_all(client):
     view = ensure_dns_view(client)
     zone = ensure_auth_zone(client, view["id"])
     ensure_records(client, zone["id"])
-    dc_host = find_dc_host(client)
+    authority = resolve_dns_authority(client)
 
-    # Healthy state: the DC host IS on the zone's Authoritative DNS Servers
+    # Healthy state: the DNS server IS on the zone's Authoritative DNS Servers
     # list. Part 2's break takes it off.
-    set_authoritative_servers(client, zone["id"], [dc_host["id"]])
-    ok(f"{cfg.ZONE_FQDN} is authoritative on "
-       f"{dc_host.get('name') or dc_host.get('absolute_name')}")
+    set_authoritative_servers(client, zone["id"], authority, attached=True)
+    ok(f"{cfg.ZONE_FQDN} is authoritative on {authority['name']}")
 
     print("\n=== Baseline: IPAM / DHCP ===", flush=True)
     space = ensure_ip_space(client)
@@ -381,8 +491,13 @@ def build_all(client):
     return {
         "view_id": view["id"],
         "zone_id": zone["id"],
-        "dc_host_id": dc_host["id"],
-        "dc_host_name": dc_host.get("name") or dc_host.get("absolute_name"),
+        # The descriptor the break, the fix and check_c2 all work from, plus
+        # flattened copies so a human reading seed_ids.json can see at a glance
+        # which variant this tenant got.
+        "authority": authority,
+        "auth_mode": authority["mode"],
+        "dns_server_id": authority["id"],
+        "dns_server_name": authority["name"],
         "space_id": space["id"],
         "dc_subnet_id": subnets["dc-01"]["id"],
         "branch_subnet_id": branch["id"],

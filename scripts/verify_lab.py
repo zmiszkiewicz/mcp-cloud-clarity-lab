@@ -142,24 +142,24 @@ def check_c2(client, ids):
     a configuration that says a server should answer is not the same thing as a
     server that does, and the whole lesson of the incident is that gap.
     """
-    dc_host_id = ids["dc_host_id"]
-    dc_host_name = ids.get("dc_host_name", cfg.DC_HOST_NAME)
+    import breaks
 
+    authority = breaks._authority(ids)
     servers = baseline.authoritative_server_ids(client, ids["zone_id"])
 
     if not servers:
         fail(f"{cfg.ZONE_FQDN.rstrip('.')} still has no authoritative DNS "
-             f"servers assigned, so {dc_host_name} has no idea it is supposed "
-             f"to answer for that zone. Ask the assistant to add it.")
+             f"servers assigned, so {authority['name']} has no idea it is "
+             f"supposed to answer for that zone. Ask the assistant to add it.")
 
-    if dc_host_id not in servers:
+    if authority["id"] not in servers:
         fail(f"{cfg.ZONE_FQDN.rstrip('.')} now has {len(servers)} "
-             f"authoritative server(s), but {dc_host_name} — the server the "
-             f"ticket names — is not one of them. That is the server on "
-             f"{cfg.SUBNETS['dc-01']['address']}/{cfg.SUBNETS['dc-01']['cidr']} "
-             f"returning NXDOMAIN.")
+             f"authoritative server(s), but {authority['name']} — the one the "
+             f"ticket points at — is not among them. That is what is serving "
+             f"{cfg.SUBNETS['dc-01']['address']}/"
+             f"{cfg.SUBNETS['dc-01']['cidr']}.")
 
-    ok(f"{dc_host_name} is authoritative for {cfg.ZONE_FQDN.rstrip('.')}")
+    ok(f"{authority['name']} is authoritative for {cfg.ZONE_FQDN.rstrip('.')}")
 
     # -- The zone actually answers ------------------------------------------
     check_zone_resolves()
