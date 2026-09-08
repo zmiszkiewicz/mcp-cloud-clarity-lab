@@ -106,8 +106,6 @@ python3 teardown_lab.py --reset                 # teardown, then re-seed clean
 | `BEDROCK_REGION` | `us-east-1` | Bedrock **and** VPC region. Must be in `config.yml` and have model access granted. |
 | `AGENT_KEY_FILE` | `/opt/lab/mcp_key` | The key baked into the MCP registration. Rewrite it, then re-run `setup_claude_code.sh --keys-only`. |
 | `AWS_MCP_ENABLED` | `1` | Set `0` to run Infoblox-only, e.g. when debugging Parts 1/2/4. |
-| `LAB_ANSWER_FILE` | `/opt/lab/answer_c1.txt` | Where `lab-answer` records the Part 1 count. |
-| `LAB_MIN_SERVICES` | `10` | Plausibility floor for that count. See TODO-33. |
 | `LAB_DC_RESOLVER` | *unset* | Resolver the Part 2 `dig` probe queries. **TODO-22** — the probe is skipped while unset. |
 
 ### Topology — change these and you must change the matching `assignment.md` prose

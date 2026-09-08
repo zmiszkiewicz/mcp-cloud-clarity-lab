@@ -52,52 +52,20 @@ def check_c1(client, ids):
     """
     Confirm the assistant is genuinely connected to THIS participant's tenant.
 
-    Two assertions, in the order that produces the most useful failure message.
+    A READINESS GATE, not a test of the participant. Part 1 is read-only —
+    they connect, look around, and ask what the server exposes. Nothing in the
+    tenant changes, so there is no participant-authored end state to assert.
 
-    First the participant's recorded answer — the number of services the
-    connection check returned, written with the `lab-answer` helper. Instruqt
-    has no native free-text answer field on a challenge, so that helper is how
-    the track flow's "quiz field" is realised.
+    What IS worth asserting is that the connection behind all of it is real.
+    The read-only Service API key is checked with the same
+    `Authorization: Token` header the Infoblox MCP Server uses, so a key that
+    works here is the same key working there. If it does not, the participant
+    had a hollow conversation and every later part inherits the problem — far
+    better to say so now than to let them discover it mid-incident in Part 2.
 
-    It is validated for PLAUSIBILITY, not for exactness. A healthy connection
-    returns dozens of entries and a broken one returns nothing, so a number in
-    the right band proves the participant looked at a real catalog. Comparing
-    against an exact count would need to know which endpoint the MCP
-    service-discovery tool wraps, and it is NOT /api/infra/v1/services — that
-    lists deployed services on hosts, which is a different thing. Failing
-    someone who counted correctly against the wrong oracle would be worse than
-    not checking at all. TODO-33 tracks pinning it down.
-
-    Second, and this is the real signal: the read-only Service API key
-    authenticates, using the same `Authorization: Token` header the Infoblox MCP
-    Server uses. Since the assistant runs against that same key, a key that
-    works is strong evidence the Assistant tab works too — and a key that does
-    not tells the participant something useful instead of failing them silently.
+    The failure messages are written accordingly: they say plainly that this is
+    an environment fault, not the participant's mistake.
     """
-    # -- The recorded answer -------------------------------------------------
-    answer = None
-    if os.path.exists(cfg.ANSWER_FILE):
-        with open(cfg.ANSWER_FILE) as handle:
-            raw = handle.read().strip()
-        try:
-            answer = int("".join(ch for ch in raw if ch.isdigit()) or "0")
-        except ValueError:
-            answer = None
-
-    if answer is None:
-        fail("Record the number of services the connection check returned "
-             "before clicking Check. In the Terminal tab, run: lab-answer <number>")
-
-    if answer < cfg.MIN_PLAUSIBLE_SERVICE_COUNT:
-        fail(f"You recorded {answer} services. A healthy connection to the "
-             f"Infoblox MCP Server returns dozens — if the assistant really did "
-             f"return only {answer}, the connection is not healthy and your "
-             f"facilitator needs to know. Re-run the connection check and count "
-             f"the entries in the service list.")
-
-    ok(f"recorded service count: {answer}")
-
-    # -- The key genuinely works ---------------------------------------------
     key = read_state("mcp_ro_key")
     key_client = CspClient.from_service_key(key)
 
@@ -109,19 +77,19 @@ def check_c1(client, ids):
              "Server role is assigned, the connection is refused outright "
              f"rather than degraded. (HTTP {exc.status}) Tell your facilitator.")
 
-    # A healthy connection returns a substantial catalog. One or two entries
-    # means the tenant is not entitled for what the later prompts touch, which
-    # is worth catching now rather than in the middle of Part 2.
-    if len(services) < 2:
-        fail(f"The service catalog came back with only {len(services)} "
-             f"entries. A healthy connection returns many more — the tenant may "
-             f"not be fully entitled. That is an environment fault, not your "
-             f"mistake. Tell your facilitator.")
+    ok(f"read-only key authenticates against your tenant "
+       f"({len(services)} infrastructure service(s) visible)")
 
-    ok(f"read-only key authenticates and sees {len(services)} services")
-
-    # The zone the rest of the track depends on must be visible to that key too.
+    # The DDI data behind the MCP server has to be readable too. An
+    # ib-mcp-server-* role on its own gates the connection but grants no access
+    # to DNS, DHCP or IPAM — a key with only that connects and then returns
+    # nothing, which reads as a broken lab rather than a permissions problem.
     views = key_client.list_results(cfg.path("dns_view"))
+    if not views:
+        fail("Your service key connects but can see no DNS views at all. That "
+             "usually means the service user has an MCP Server role but no "
+             "matching DDI role. It is an environment fault, not your mistake "
+             "— tell your facilitator.")
     ok(f"the key can read DDI data ({len(views)} DNS view(s) visible)")
 
 

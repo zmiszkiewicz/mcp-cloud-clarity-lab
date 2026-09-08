@@ -138,16 +138,6 @@ CLAUDE_PROJECT_DIR = os.environ.get("CLAUDE_PROJECT_DIR", "/root/techcorp")
 # challenge boundary is where that happens.
 AGENT_KEY_FILE = os.environ.get("AGENT_KEY_FILE", "/opt/lab/mcp_key")
 
-# Where the `lab-answer` helper records the number the participant reads off the
-# Part 1 connection check. Instruqt has no native free-text answer field on a
-# challenge, so the helper is how the track flow's "quiz field" is realised.
-ANSWER_FILE = os.environ.get("LAB_ANSWER_FILE", "/opt/lab/answer_c1.txt")
-
-# A healthy MCP connection returns a service catalog with dozens of entries; a
-# broken one returns nothing or a handful. See TODO-33 for why this is a band
-# rather than an exact comparison.
-MIN_PLAUSIBLE_SERVICE_COUNT = int(os.environ.get("LAB_MIN_SERVICES", "10"))
-
 # The AWS MCP server Claude Code runs alongside Infoblox for Part 3.
 AWS_MCP_ENABLED = os.environ.get("AWS_MCP_ENABLED", "1") not in ("0", "false", "")
 
@@ -490,17 +480,6 @@ PATHS = {
         "REST path for Access Locations, and which field carries the Cloud "
         "Service IP the test VM must query. Part 3 step 3 needs that IP; today "
         "it is read from terraform output or supplied via LAB_DNS_SERVICE_IP.",
-    ),
-    "service_catalog": Todo(
-        "TODO-33",
-        "Which endpoint does the MCP server's service-discovery tool actually "
-        "wrap? Part 1 asks the participant to count the services it returns and "
-        "the check would like to compare that number against the tenant. "
-        "/api/infra/v1/services lists DEPLOYED services on hosts, which is a "
-        "different thing from the CSP service catalog the discovery tool "
-        "describes — comparing against it would fail participants who counted "
-        "correctly. Until the right endpoint is known, check_c1 validates the "
-        "answer for plausibility rather than for exactness.",
     ),
     "dhcp_lease": Todo(
         "TODO-15",
