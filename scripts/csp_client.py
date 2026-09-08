@@ -20,6 +20,7 @@ check to be able to reproduce that. Those calls use
 import json
 import os
 import random
+import re
 import sys
 import time
 
@@ -31,6 +32,24 @@ from lab_config import LabTodo  # re-exported so callers import it from one plac
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 5
+
+# CSP rejects a create that includes a server-derived field with, verbatim:
+#   {"error":[{"message":"The 'parent' field is read-only and cannot be provided."}]}
+#
+# This matters more than it looks. Infoblox's OpenAPI-generated Go client — the
+# thing this lab uses as its reference for payload shapes — marks several such
+# fields as ordinary optional writables. `parent` on both FixedAddress and Range
+# is documented that way and is NOT accepted by the live API. So the generated
+# client is a guide to what fields EXIST, not to which ones you may send.
+#
+# Rather than discover each one on a separate failed track start, a request that
+# trips this strips the offending field and retries. The field is server-derived
+# by definition — that is what read-only means here — so dropping it cannot
+# change where the object lands.
+READONLY_FIELD_RE = re.compile(
+    r"The '([^']+)' field is read-only", re.IGNORECASE
+)
+MAX_READONLY_STRIPS = 6
 
 
 class CspError(RuntimeError):
@@ -168,6 +187,7 @@ class CspClient:
         url = f"{self.base_url}{path}"
         expect = set(expect) if expect else {200, 201, 204}
         last = None
+        stripped = []
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -192,6 +212,23 @@ class CspClient:
                 last = f"HTTP {resp.status_code}"
                 time.sleep(min(2 ** attempt + random.random(), 20))
                 continue
+
+            # A server-derived field we should not have sent. Drop it and retry
+            # rather than failing the whole track start over a payload the
+            # generated client said was fine. See READONLY_FIELD_RE.
+            if resp.status_code == 400 and isinstance(json_body, dict):
+                match = READONLY_FIELD_RE.search(resp.text)
+                field = match.group(1) if match else None
+                if (field and field in json_body
+                        and len(stripped) < MAX_READONLY_STRIPS):
+                    json_body.pop(field)
+                    stripped.append(field)
+                    print(f"⚠️  CSP rejected {method} {path}: '{field}' is "
+                          f"read-only. Dropping it and retrying.\n"
+                          f"    Remove it from the payload permanently — the "
+                          f"OpenAPI client documents it as writable, and it is "
+                          f"not.", flush=True)
+                    continue
 
             # CSP answers an unrecognised path with 501 Not Implemented, which
             # reads like an unsupported HTTP verb rather than a bad URL. The

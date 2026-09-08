@@ -372,7 +372,7 @@ def ensure_subnets(client, space_id):
     return subnets
 
 
-def ensure_reserved_block(client, space_id, subnet_id):
+def ensure_reserved_block(client, space_id):
     """
     The reserved addresses in Branch-02 that the DHCP range must not collide
     with. Seeded healthy; Part 4's break moves the RANGE onto them, not the
@@ -400,10 +400,14 @@ def ensure_reserved_block(client, space_id, subnet_id):
             continue
         octets = address.split(".")
         mac = "02:42:" + ":".join(f"{int(o):02x}" for o in octets)
+        # NO `parent` HERE. The live API rejects it —
+        #   "The 'parent' field is read-only and cannot be provided."
+        # — even though the OpenAPI-generated Go client documents it as an
+        # ordinary optional writable. CSP derives the parent subnet from
+        # `ip_space` plus the address itself, so passing it adds nothing.
         row = client.post(cfg.path("dhcp_fixed_address"), json_body={
             "address": address,
             "ip_space": space_id,
-            "parent": subnet_id,
             "name": f"{reserved['name']} {address}",
             "comment": "Branch-02 infrastructure - do not assign",
             "match_type": "mac",
@@ -485,7 +489,7 @@ def build_all(client):
     ensure_address_block(client, space["id"])
     subnets = ensure_subnets(client, space["id"])
     branch = subnets["branch-02"]
-    ensure_reserved_block(client, space["id"], branch["id"])
+    ensure_reserved_block(client, space["id"])
     dhcp_range = ensure_dhcp_range(client, space["id"], branch["id"])
 
     return {
