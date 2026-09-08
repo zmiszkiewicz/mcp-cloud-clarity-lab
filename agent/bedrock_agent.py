@@ -115,6 +115,9 @@ async def run_turn(user_message, history, on_event=None):
         for warning in fleet.warnings:
             emit("warning", warning)
 
+        if fleet.transport:
+            emit("transport", fleet.transport)
+
         tools = await fleet.list_tools()
         emit("thinking",
              f"{len(tools)} tools available from: {', '.join(fleet.server_ids)}")

@@ -54,6 +54,12 @@ with st.sidebar:
     st.code(cfg.BEDROCK_MODEL_ID, language=None)
     st.caption(f"Amazon Bedrock · `{cfg.AWS_REGION}`")
 
+    # Recorded on the first successful turn. Worth surfacing: which transport
+    # the hosted server actually speaks was an open question through several
+    # builds, and this is where it gets answered.
+    if st.session_state.get("transport"):
+        st.caption(f"Transport: `{st.session_state['transport']}`")
+
     # Which Infoblox credential is in force right now. This changes when Part 2
     # hands over the read/write key and changes back at Part 4 — worth showing,
     # because "which credential am I acting as" is the lesson underneath the
@@ -163,6 +169,8 @@ if prompt:
             st.session_state.transcript.append(entry)
             with live:
                 render(entry)
+        elif kind == "transport":
+            st.session_state["transport"] = payload
         elif kind == "warning":
             entry = {"kind": "warning", "text": payload}
             st.session_state.transcript.append(entry)

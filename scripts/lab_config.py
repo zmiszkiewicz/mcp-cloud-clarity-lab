@@ -112,7 +112,21 @@ TERRAFORM_DIR = os.path.join(LAB_DIR, "terraform")
 # DDI side and AWS for the cloud side — which is what makes Part 3's single
 # conversation possible.
 
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-opus-5")
+# The model the assistant runs on.
+#
+# Normally SET BY DISCOVERY: 01/setup-shell runs pick_bedrock_model.py, which
+# asks Bedrock which Anthropic models this account can actually invoke in this
+# region and exports the newest Sonnet. The value below is only the fallback for
+# when that cannot run.
+#
+# Sonnet rather than Opus deliberately. This track's work is tool-calling
+# against two MCP servers with short reasoning hops between calls — Sonnet is
+# well suited to that and noticeably faster to first token, which matters when a
+# participant is watching a Part 3 deployment run a dozen calls.
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-sonnet-5")
+
+# Which family discovery should prefer. Comma-separated, most preferred first.
+BEDROCK_MODEL_PREFERENCE = os.environ.get("BEDROCK_MODEL_PREFERENCE", "sonnet")
 AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
 # The agent reads its Infoblox Service API key from this file on EVERY turn,

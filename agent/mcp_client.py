@@ -54,6 +54,73 @@ class McpUnavailable(RuntimeError):
 
 
 # --------------------------------------------------------------------------- #
+# Transport discovery
+# --------------------------------------------------------------------------- #
+#
+# The `mcp` package has moved this factory's name around between releases, and
+# importing a specific symbol at module scope turns a rename into an ImportError
+# at the participant's first question. Look it up instead.
+#
+# Order matters: Streamable HTTP first because it is the current standard and
+# what a hosted /mcp endpoint most likely serves; HTTP+SSE second as the older
+# fallback. Set MCP_TRANSPORT to pin one once you know which it is.
+
+_STREAMABLE_HTTP_NAMES = (
+    "streamablehttp_client",       # documented name in mcp 1.9-era releases
+    "streamable_http_client",      # snake_case variant
+    "streamablehttp",
+    "connect",
+)
+_SSE_NAMES = ("sse_client", "connect_sse", "connect")
+
+
+def _factories_in(module_name, candidate_names):
+    """Every plausible client factory a transport module exposes, best first."""
+    try:
+        module = __import__(module_name, fromlist=["*"])
+    except ImportError:
+        return []
+
+    found, seen = [], set()
+    for name in candidate_names:
+        fn = getattr(module, name, None)
+        if callable(fn) and name not in seen:
+            found.append((name, fn))
+            seen.add(name)
+
+    # Nothing matched the known names — the package renamed it again. Take any
+    # public callable whose name looks like a client factory rather than giving
+    # up, and let the connection attempt decide whether it was the right one.
+    if not found:
+        for name in dir(module):
+            if name.startswith("_") or name in seen:
+                continue
+            if name.endswith("client") or name.startswith("connect"):
+                fn = getattr(module, name)
+                if callable(fn):
+                    found.append((name, fn))
+    return found
+
+
+def _transport_candidates():
+    """[(label, factory), ...] to try in order."""
+    pinned = os.environ.get("MCP_TRANSPORT", "").strip().lower()
+
+    transports = [
+        ("streamable-http", "mcp.client.streamable_http", _STREAMABLE_HTTP_NAMES),
+        ("sse", "mcp.client.sse", _SSE_NAMES),
+    ]
+    if pinned:
+        transports = [t for t in transports if t[0] == pinned] or transports
+
+    candidates = []
+    for label, module_name, names in transports:
+        for symbol, factory in _factories_in(module_name, names):
+            candidates.append((f"{label} ({module_name}.{symbol})", factory))
+    return candidates
+
+
+# --------------------------------------------------------------------------- #
 # Infoblox credential
 # --------------------------------------------------------------------------- #
 
@@ -106,6 +173,7 @@ class McpFleet:
         self._exit_stack = None
         self._sessions = {}       # server id -> ClientSession
         self.warnings = []        # non-fatal problems worth showing the learner
+        self.transport = None     # which transport actually connected
 
     # ------------------------------------------------------------- lifecycle -
 
@@ -136,34 +204,62 @@ class McpFleet:
 
     async def _connect_infoblox(self):
         """
-        TODO-27 — transport. This uses Streamable HTTP, the current MCP standard
-        transport and what a hosted server at an /mcp path almost certainly
-        speaks. If the Infoblox MCP Server turns out to expose HTTP+SSE instead,
-        swap `streamablehttp_client` for `sse_client` from `mcp.client.sse`;
-        nothing else in this class is transport-aware. Confirm against the MCP
-        Setup Guide before the event.
+        Connect to the hosted Infoblox MCP Server, negotiating the transport.
+
+        TWO THINGS VARY HERE AND BOTH BIT US.
+
+        First, WHICH TRANSPORT the server speaks. Streamable HTTP is the current
+        standard and what a hosted `/mcp` endpoint almost certainly serves, but
+        HTTP+SSE is the older alternative and some deployments still use it.
+
+        Second, WHAT THE CLIENT LIBRARY CALLS IT. `mcp.client.streamable_http`
+        exists across versions but the factory inside it has not kept one name —
+        a pinned `mcp>=1.9.0` resolved to a build where importing
+        `streamablehttp_client` raises ImportError even though the module is
+        right there. Importing a specific symbol at module scope turns that into
+        a dead assistant with an error that looks like a packaging fault.
+
+        So: try each candidate in turn and use the first that connects. The
+        winner is recorded in `self.transport` and shown in the UI sidebar, which
+        also answers TODO-27 empirically on the first real run instead of by
+        reading documentation.
         """
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
 
-        try:
-            read, write, _ = await self._exit_stack.enter_async_context(
-                streamablehttp_client(self.infoblox_url, headers=auth_headers())
-            )
-            session = await self._exit_stack.enter_async_context(
-                ClientSession(read, write)
-            )
-            await session.initialize()
-        except Exception as exc:                        # noqa: BLE001
-            raise McpUnavailable(
-                f"Could not connect to the Infoblox MCP Server at "
-                f"{self.infoblox_url}. Access is gated by role-based access "
-                f"control — if the service user behind your key has no MCP "
-                f"Server role, the connection is refused outright rather than "
-                f"degraded. ({exc})"
-            ) from exc
+        attempts, last_exc = [], None
 
-        self._sessions["infoblox"] = session
+        for label, factory in _transport_candidates():
+            try:
+                streams = await self._exit_stack.enter_async_context(
+                    factory(self.infoblox_url, headers=auth_headers())
+                )
+                # streamablehttp yields (read, write, get_session_id); sse yields
+                # (read, write). Take the first two either way.
+                read, write = streams[0], streams[1]
+                session = await self._exit_stack.enter_async_context(
+                    ClientSession(read, write)
+                )
+                await session.initialize()
+            except Exception as exc:                    # noqa: BLE001
+                attempts.append(f"{label}: {type(exc).__name__}: {exc}")
+                last_exc = exc
+                continue
+
+            self._sessions["infoblox"] = session
+            self.transport = label
+            return
+
+        raise McpUnavailable(
+            f"Could not connect to the Infoblox MCP Server at "
+            f"{self.infoblox_url} over any supported transport.\n\n"
+            + "\n".join(f"  - {a}" for a in attempts)
+            + "\n\nIf every attempt is an ImportError, the installed `mcp` "
+              "package does not expose the transports this agent knows about — "
+              "run `python3 scripts/mcp_probe.py` to see what it does export. "
+              "If they are connection or auth errors instead, note that access "
+              "is gated by role-based access control: a service user with no "
+              "MCP Server role is refused outright rather than degraded."
+        ) from last_exc
 
     async def _connect_aws(self):
         """

@@ -21,6 +21,8 @@ scripts/
   revoke_mcp_keys.py    idempotent key revoke + service user delete
   teardown_lab.py       remove seeded objects; safe to run twice
   preflight.sh          offline checks; run before every git push
+  pick_bedrock_model.py asks Bedrock which Claude models this account can invoke
+  mcp_probe.py          what the mcp package exposes, and does the server answer
   traffic/README.md     iq-insighter wiring (TODO-19)
   ...vendored from iracic82, unchanged:
      allocation_subtenant.py  deallocation_subtenant.py  cleanup_broker_allocation.py
@@ -55,6 +57,9 @@ LAB_AUTH_MODE=nsg  python3 seed_lab.py          # force the host-free variant
 LAB_AUTH_MODE=host python3 seed_lab.py          # refuse to run without a host
 
 python3 verify_lab.py --stage all               # every check, smoke test
+
+python3 pick_bedrock_model.py --list            # every invokable Claude model
+python3 mcp_probe.py                            # transport + live connection test
 
 python3 teardown_lab.py --dry-run               # list what would be deleted
 python3 teardown_lab.py --reset                 # teardown, then re-seed clean
@@ -98,7 +103,10 @@ python3 teardown_lab.py --reset                 # teardown, then re-seed clean
 | `LAB_REPO_URL` | `https://github.com/zmiszkiewicz/mcp-cloud-clarity-lab.git` | Repo `setup-shell` clones. |
 | `LAB_REPO_REF` | `main` | Branch to clone. Set this to test a branch without editing `setup-shell`. |
 | `LAB_DIR` | `/root/infoblox-lab/mcp-cloud-clarity-lab` | Clone destination. |
-| `BEDROCK_MODEL_ID` | `anthropic.claude-opus-5` | Bedrock model id (note the `anthropic.` prefix Bedrock requires). |
+| `BEDROCK_MODEL_ID` | *discovered* | Set by `pick_bedrock_model.py` at setup. Setting it explicitly skips discovery. |
+| `BEDROCK_MODEL_PREFERENCE` | `sonnet` | Family discovery prefers, most preferred first. |
+| `BEDROCK_FALLBACK_MODEL_ID` | `anthropic.claude-sonnet-5` | Used only if discovery cannot run at all. |
+| `MCP_TRANSPORT` | *unset* | Pin `streamable-http` or `sse` once `mcp_probe.py` has told you which. Unset negotiates. |
 | `BEDROCK_REGION` | `us-east-1` | Bedrock **and** VPC region. Must be in `config.yml` and have model access granted. |
 | `AGENT_KEY_FILE` | `/opt/lab/mcp_key` | The key the assistant re-reads every turn. Rewriting it swaps its permissions live. |
 | `AGENT_PORT` | `8501` | Port the chat tab serves on; must match `config.yml` and the `service` tabs. |
