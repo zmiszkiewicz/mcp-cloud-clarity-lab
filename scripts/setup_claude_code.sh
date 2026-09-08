@@ -64,7 +64,56 @@ if [ "${KEYS_ONLY}" -eq 0 ]; then
     echo "❌ claude is not on PATH after install. Looked in /root/.local/bin."
     exit 1
   }
-  echo "✅ $(claude --version 2>&1 | head -1)"
+  echo "✅ $(claude --version 2>&1 | head -1) at $(command -v claude)"
+
+  # ------------------------------------------------------------------------ #
+  # MAKE IT REACHABLE FROM THE PARTICIPANT'S SHELL.
+  #
+  # The PATH export at the top of this script is scoped to this script. The
+  # installer puts the binary in ~/.local/bin, which is NOT on the default PATH
+  # in this container — so setup succeeded, reported success, and the
+  # participant still got `bash: claude: command not found`. Setup passing and
+  # the lab working were two different things.
+  #
+  # Three remedies, because interactive and login shells read different files
+  # and it is not worth betting on which one a terminal tab gives you:
+  #
+  #   /usr/local/bin symlink   already on PATH for every shell. The reliable one.
+  #   /etc/profile.d           login shells (bash -l), which do NOT read .bashrc
+  #   /root/.bashrc            interactive non-login shells, which do
+  # ------------------------------------------------------------------------ #
+  ln -sf "$(command -v claude)" /usr/local/bin/claude
+
+  cat > /etc/profile.d/claude-code.sh <<'PROFILE'
+# Claude Code installs to ~/.local/bin, which is not on this container's
+# default PATH.
+case ":$PATH:" in
+  *":/root/.local/bin:"*) ;;
+  *) export PATH="/root/.local/bin:$PATH" ;;
+esac
+PROFILE
+  chmod 0644 /etc/profile.d/claude-code.sh
+
+  grep -q '/root/.local/bin' /root/.bashrc 2>/dev/null || \
+    echo 'export PATH="/root/.local/bin:$PATH"' >> /root/.bashrc
+
+  # Verify the way the PARTICIPANT will experience it, not the way this script
+  # does. Setup previously passed while the Assistant tab said "command not
+  # found", because this script had the binary on its own PATH and never
+  # checked anyone else's.
+  interactive_ok=0; login_ok=0
+  bash -ic  'command -v claude' >/dev/null 2>&1 && interactive_ok=1
+  bash -lic 'command -v claude' >/dev/null 2>&1 && login_ok=1
+  echo "   reachable from an interactive shell: ${interactive_ok}"
+  echo "   reachable from a login shell:        ${login_ok}"
+
+  if [ "${interactive_ok}" -eq 0 ] && [ "${login_ok}" -eq 0 ]; then
+    echo "❌ claude is installed at $(command -v claude) but no shell the"
+    echo "   participant opens can find it. The Assistant tab would report"
+    echo "   'command not found'."
+    echo "   /usr/local/bin/claude: $(ls -l /usr/local/bin/claude 2>&1)"
+    exit 1
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
