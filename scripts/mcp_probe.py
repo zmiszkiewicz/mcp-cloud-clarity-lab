@@ -34,6 +34,20 @@ def report_package():
     except Exception as exc:                            # noqa: BLE001
         print(f"mcp package version: unknown ({exc})")
 
+    for library in ("httpx2", "httpx"):
+        try:
+            mod = __import__(library)
+            ver = getattr(mod, "__version__", "?")
+            print(f"  {library}: present ({ver})")
+        except ImportError:
+            print(f"  {library}: NOT INSTALLED")
+
+    try:
+        from mcp.shared._httpx_utils import create_mcp_http_client  # noqa: F401
+        print("  create_mcp_http_client: available (use this, not a direct import)")
+    except ImportError as exc:
+        print(f"  create_mcp_http_client: NOT AVAILABLE ({exc})")
+
     for module_name in ("mcp.client.streamable_http", "mcp.client.sse",
                         "mcp.client.stdio"):
         try:

@@ -102,6 +102,48 @@ def _factories_in(module_name, candidate_names):
     return found
 
 
+def _http_client(headers):
+    """
+    An HTTP client the installed MCP transport will accept, carrying our auth.
+
+    DO NOT `import httpx` HERE. mcp 2.x is built on **httpx2**, not httpx — its
+    type hints read `httpx2.AsyncClient` — and the venv has no `httpx` at all,
+    so importing it by name is a ModuleNotFoundError dressed up as a connection
+    failure. Guessing the other name instead would be the same mistake with a
+    different spelling.
+
+    So ask the SDK. `create_mcp_http_client(headers=...)` is exported from both
+    transport modules and returns whatever client that build expects, already
+    configured the way MCP wants it. The direct imports below are only for a
+    build that does not export it.
+    """
+    for module_name in ("mcp.shared._httpx_utils",
+                        "mcp.client.streamable_http",
+                        "mcp.client.sse"):
+        try:
+            module = __import__(module_name, fromlist=["create_mcp_http_client"])
+        except ImportError:
+            continue
+        factory = getattr(module, "create_mcp_http_client", None)
+        if callable(factory):
+            return factory(headers=headers)
+
+    # No SDK factory. Try the http libraries it might be built on, newest
+    # convention first.
+    for library in ("httpx2", "httpx"):
+        try:
+            module = __import__(library)
+        except ImportError:
+            continue
+        return module.AsyncClient(headers=headers, timeout=60.0)
+
+    raise McpUnavailable(
+        "The installed mcp package exposes no create_mcp_http_client, and "
+        "neither httpx2 nor httpx is importable — there is no way to build an "
+        "authenticated HTTP client. Check the agent venv."
+    )
+
+
 def _transport_candidates():
     """[(label, factory), ...] to try in order."""
     pinned = os.environ.get("MCP_TRANSPORT", "").strip().lower()
@@ -298,9 +340,8 @@ class McpFleet:
             return factory(self.infoblox_url, headers=headers)
 
         if "http_client" in params:
-            import httpx
             client = await self._exit_stack.enter_async_context(
-                httpx.AsyncClient(headers=headers, timeout=60.0)
+                _http_client(headers)
             )
             return factory(self.infoblox_url, http_client=client)
 
