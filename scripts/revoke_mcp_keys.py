@@ -45,7 +45,7 @@ def shred_key_files():
     The sandbox is destroyed shortly after anyway, but the files are mode 0600
     secrets and removing them is free.
     """
-    for state_key in ("mcp_ro_key", "mcp_rw_key"):
+    for state_key in ("mcp_key", "mcp_ro_key"):
         filename = cfg.STATE_FILES[state_key]
         for directory in (os.getcwd(), cfg.SCRIPT_DIR):
             candidate = os.path.join(directory, filename)
@@ -134,9 +134,12 @@ def main():
               flush=True)
         return 0
 
+    # Whichever the run created. revoke_key() treats a missing state file as
+    # "never existed" and returns success, so listing all three is safe
+    # regardless of MCP_ROLES.
     outcomes = [
+        revoke_key(client, "mcp_key_id", "read/write"),
         revoke_key(client, "mcp_ro_key_id", "read-only"),
-        revoke_key(client, "mcp_rw_key_id", "read/write"),
     ]
 
     if not args.keep_user:

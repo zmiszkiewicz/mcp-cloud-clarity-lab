@@ -27,9 +27,10 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
-# Amazon Linux 2023 has the SSM agent preinstalled, which is how the Part 3
-# check reaches in to run dig. Looked up rather than pinned so the lab does not
-# rot when the AMI is rotated.
+# Amazon Linux 2023, for two properties the probe depends on: the SSM agent is
+# preinstalled (how the check reaches in) and so is python3 (how it queries
+# DNS, since this subnet cannot install packages). Looked up rather than pinned
+# so the lab does not rot when the AMI is rotated.
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -183,11 +184,15 @@ resource "aws_instance" "test_vm" {
   vpc_security_group_ids = [aws_security_group.test_vm.id]
   iam_instance_profile   = aws_iam_instance_profile.test_vm.name
 
-  # bind-utils gives us dig. Everything else about this VM is deliberately
-  # boring: it exists to answer "can a workload in here resolve the name".
+  # NO PACKAGE INSTALLS HERE. This subnet has no internet gateway and no NAT,
+  # which is the point — it is what a real private workload subnet looks like.
+  # An earlier version installed bind-utils for `dig`; it could never have
+  # worked, and the DNS probe then called a binary that was not present.
+  #
+  # scripts/cloud_vpc.py queries DNS with a pure-stdlib Python client instead,
+  # run over SSM. Amazon Linux 2023 ships python3, so the VM needs nothing.
   user_data = <<-EOT
     #!/bin/bash
-    dnf install -y bind-utils >/dev/null 2>&1 || yum install -y bind-utils
     echo "techcorp ai workload test host" > /etc/motd
   EOT
 

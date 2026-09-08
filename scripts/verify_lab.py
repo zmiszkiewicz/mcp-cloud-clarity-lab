@@ -66,7 +66,7 @@ def check_c1(client, ids):
     The failure messages are written accordingly: they say plainly that this is
     an environment fault, not the participant's mistake.
     """
-    key = read_state("mcp_ro_key")
+    key = read_state("mcp_key")
     key_client = CspClient.from_service_key(key)
 
     try:
@@ -302,18 +302,20 @@ def _check_c3_cloud(cloud_vpc):
 
 def check_c4(client, ids):
     """
-    Two assertions.
-
-    The RBAC exercise and the tool-discovery exercise are both read-only and
-    leave nothing behind to verify — they are for the participant's
-    understanding. What IS verifiable is that the read-only key really is
-    read-only (otherwise the RBAC exercise teaches a false lesson and the
-    maintainer needs to know), and that the unguided break was found and fixed
-    with no prompt scaffolding.
+    The access-control exercise and the tool-discovery exercise are both
+    read-only and leave nothing behind to verify — they are for the
+    participant's understanding. What IS verifiable is that the unguided break
+    was found and fixed with no prompt scaffolding, which is the real skills
+    test in this part.
     """
     import breaks
 
-    # -- The read-only key is genuinely read-only ----------------------------
+    # -- If a read-only key exists, confirm it really is read-only -----------
+    #
+    # Only present when MCP_ROLES includes read_only. With the default single
+    # read/write key there is nothing to probe: Part 4's access-control lesson
+    # now rests on the MCP Server not exposing user administration at all,
+    # which needs no assertion because the tool simply is not there.
     ro_key = read_state("mcp_ro_key", required=False)
     if ro_key:
         ro_client = CspClient.from_service_key(ro_key)
@@ -325,9 +327,7 @@ def check_c4(client, ids):
         except CspError as exc:
             if exc.status in (200, 201):
                 fail("The read-only key was able to write. This is a lab "
-                     "defect, not your mistake — tell your facilitator; the "
-                     "RBAC exercise does not demonstrate anything as it "
-                     "stands.")
+                     "defect, not your mistake — tell your facilitator.")
             info(f"read-only write probe returned {exc.status} "
                  f"(treated as denied)")
 

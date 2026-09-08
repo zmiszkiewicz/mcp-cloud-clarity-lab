@@ -172,6 +172,18 @@ MCP_RW_GROUPS = [
 MCP_RO_GROUP = os.environ.get("MCP_RO_GROUP")
 MCP_RW_GROUP = os.environ.get("MCP_RW_GROUP")
 
+# Which service users to provision. ONE, read/write, by default.
+#
+# The track used to mint two and swap between them at Part 2 and Part 4, so that
+# "the assistant could not have written even if it tried" was enforced by CSP
+# rather than claimed by the prose. In practice it meant a key swap plus a
+# Claude Code restart at two challenge boundaries, and participants arriving at
+# Part 2 unable to make the change they had just been told to make.
+#
+# Set MCP_ROLES=read_only,read_write to restore the two-key flow.
+MCP_ROLES = [r.strip() for r in
+             os.environ.get("MCP_ROLES", "read_write").split(",") if r.strip()]
+
 # How long a minted Service API key lives.
 #
 # POST /v2/current_api_keys REQUIRES expires_at. Omitting it does not default to
@@ -201,10 +213,11 @@ STATE_FILES = {
     "user_email": "user_email.txt",
     "user_password": "user_password.txt",
     "mcp_service_user_id": "mcp_service_user_id.txt",
+    "mcp_key_id": "mcp_key_id.txt",
+    "mcp_key": "mcp_key.txt",              # chmod 600 — the secret itself
+    # Only written when MCP_ROLES includes read_only — the optional two-key flow.
     "mcp_ro_key_id": "mcp_ro_key_id.txt",
-    "mcp_rw_key_id": "mcp_rw_key_id.txt",
-    "mcp_ro_key": "mcp_ro_key.txt",        # chmod 600 — the secret itself
-    "mcp_rw_key": "mcp_rw_key.txt",        # chmod 600 — the secret itself
+    "mcp_ro_key": "mcp_ro_key.txt",
     "vpc_outputs": "vpc_outputs.json",     # terraform output, Part 3
 }
 

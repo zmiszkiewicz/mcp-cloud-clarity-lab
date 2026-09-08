@@ -277,6 +277,28 @@ re-runs `setup_claude_code.sh --keys-only`, and the assignment tells the
 participant to restart Claude Code. That lands on the challenge boundary, where
 they are switching tabs anyway.
 
+## The Part 3 test VM has no internet, and that shapes the probe
+
+The workload subnet has no internet gateway and no NAT, deliberately — it is
+what a real private workload subnet looks like, and it is why the SSM interface
+endpoints exist.
+
+The consequence is easy to miss: **you cannot install anything on that VM.** An
+earlier build ran `dnf install -y bind-utils` in `user_data` to get `dig`. That
+could never have worked, and Amazon Linux 2023 does not ship bind-utils, so the
+DNS probe was calling a binary that was not there — which surfaced as an
+ambiguous SSM timeout rather than "command not found".
+
+`cloud_vpc._DNS_PROBE` is a UDP DNS client in the Python standard library,
+shipped to the VM over SSM and run with the preinstalled python3. It needs no
+packages and, unlike `getent hosts`, it can be pointed at a specific resolver —
+which Part 3 needs, since the question is whether one particular DNS service
+answers.
+
+`ssm_registered()` is checked before every probe, because "SSM cannot reach the
+VM" and "the VM cannot resolve" are different problems with different owners,
+and reporting both as one timeout wastes the time of whoever is debugging.
+
 ## Design notes
 
 **Checks read the API, never the transcript.** The assistant's wording is

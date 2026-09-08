@@ -100,31 +100,142 @@ def test_vm_instance_id():
 # The load-bearing probe: resolve from inside the VPC
 # --------------------------------------------------------------------------- #
 
-def resolve_from_test_vm(fqdn, resolver=None, timeout=90):
+# A DNS client in pure Python, run on the test VM.
+#
+# NOT `dig`. The test VM sits in a private subnet with no internet gateway and
+# no NAT — deliberately, because that is what a real workload subnet looks like
+# — so `dnf install bind-utils` in user_data could never have worked, and
+# Amazon Linux 2023 does not ship bind-utils. The probe was calling a binary
+# that was not there.
+#
+# Rather than add a NAT gateway to install one package, ask the interpreter
+# that IS there. This does a UDP query with the standard library only, and
+# unlike `getent hosts` it can be pointed at a specific resolver — which Part 3
+# needs, since the whole question is whether a particular DNS service answers.
+_DNS_PROBE = r'''
+import socket, struct, sys, random
+
+name = sys.argv[1].rstrip(".")
+server = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+
+if not server:
+    # Whatever the VM itself would use. The stricter test: it asks whether the
+    # VPC has been pointed at the new DNS service, not merely whether the
+    # service answers when aimed at directly.
+    try:
+        for line in open("/etc/resolv.conf"):
+            if line.startswith("nameserver"):
+                server = line.split()[1]
+                break
+    except OSError:
+        pass
+if not server:
+    print("NO_RESOLVER", file=sys.stderr); sys.exit(2)
+
+qid = random.randint(0, 0xFFFF)
+query = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+for label in name.split("."):
+    query += bytes([len(label)]) + label.encode()
+query += b"\x00" + struct.pack(">HH", 1, 1)          # A, IN
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(5)
+try:
+    sock.sendto(query, (server, 53))
+    data, _ = sock.recvfrom(4096)
+except Exception as exc:
+    print(f"QUERY_FAILED {server} {exc}", file=sys.stderr); sys.exit(3)
+
+rcode = data[3] & 0x0F
+if rcode == 3:
+    print(f"NXDOMAIN via {server}", file=sys.stderr); sys.exit(4)
+if rcode != 0:
+    print(f"RCODE {rcode} via {server}", file=sys.stderr); sys.exit(5)
+
+def read_name(buf, off):
+    while True:
+        length = buf[off]
+        if length == 0:
+            return off + 1
+        if length & 0xC0 == 0xC0:
+            return off + 2
+        off += 1 + length
+
+off = 12
+off = read_name(data, off) + 4                        # skip the question
+answers = []
+for _ in range(struct.unpack(">H", data[6:8])[0]):
+    off = read_name(data, off)
+    rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+    off += 10
+    if rtype == 1 and rdlen == 4:
+        answers.append(".".join(str(b) for b in data[off:off + 4]))
+    off += rdlen
+
+if not answers:
+    print(f"NO_A_RECORD via {server}", file=sys.stderr); sys.exit(6)
+for a in answers:
+    print(a)
+'''
+
+
+def ssm_registered(instance_id, wait=0):
     """
-    Run `dig` on the test VM and return the answers it got.
+    Is the VM actually managed by SSM? Optionally wait for it to become so.
+
+    Worth asking separately. Without it, a VM that has not registered produces
+    a command that sits Pending until the caller's timeout, and the resulting
+    "did not return in time" tells you nothing about why.
+    """
+    ssm = _client("ssm")
+    deadline = time.time() + max(wait, 0)
+    while True:
+        try:
+            info_rows = ssm.describe_instance_information(Filters=[
+                {"Key": "InstanceIds", "Values": [instance_id]},
+            ])["InstanceInformationList"]
+            if info_rows and info_rows[0].get("PingStatus") == "Online":
+                return True, "Online"
+            status = info_rows[0].get("PingStatus") if info_rows else "not registered"
+        except Exception as exc:                        # noqa: BLE001
+            status = f"lookup failed: {exc}"
+        if time.time() >= deadline:
+            return False, status
+        time.sleep(5)
+
+
+def resolve_from_test_vm(fqdn, resolver=None, timeout=120, ssm_wait=0):
+    """
+    Resolve a name FROM INSIDE the VPC and return the answers.
 
     Returns (answers, detail):
 
         (["10.30.1.40"], "…")   resolved
-        ([], "<why not>")       did not resolve, with a reason worth showing
+        ([], "<why not>")       did not, with a reason worth acting on
 
-    A resolver of None means "use whatever the VM's own resolv.conf says", which
-    is the more interesting question in `as-a-service` mode: if the participant
-    wired DNS into the VPC properly, the VM's default resolver already reaches
-    Universal DDI and no explicit @server is needed.
+    A resolver of None means "whatever the VM's own resolv.conf says", which is
+    the more interesting question: if DNS was wired into the VPC properly, the
+    VM's default resolver already reaches Universal DDI.
     """
+    import base64
+
     instance_id = test_vm_instance_id()
     if not instance_id:
         return [], ("The test VM in the VPC could not be found. That is an "
                     "environment fault, not your mistake — tell your "
                     "facilitator.")
 
-    server = f"@{resolver} " if resolver else ""
-    command = (
-        f"dig +short +timeout=3 +tries=2 {server}{fqdn} A "
-        f"|| echo __DIG_FAILED__"
-    )
+    online, status = ssm_registered(instance_id, wait=ssm_wait)
+    if not online:
+        return [], (f"The test VM ({instance_id}) is not reachable through SSM "
+                    f"— ping status: {status}. Nothing can run on it, so this "
+                    f"is an environment fault rather than a DNS problem. The "
+                    f"usual causes are the SSM interface endpoints not being "
+                    f"up, or the instance profile missing.")
+
+    payload = base64.b64encode(_DNS_PROBE.encode()).decode()
+    command = (f"echo {payload} | base64 -d > /tmp/dnsprobe.py && "
+               f"python3 /tmp/dnsprobe.py {fqdn} {resolver or ''}")
 
     ssm = _client("ssm")
     try:
@@ -136,7 +247,8 @@ def resolve_from_test_vm(fqdn, resolver=None, timeout=90):
         )
     except Exception as exc:                            # noqa: BLE001
         return [], (f"Could not run a command on the test VM through SSM "
-                    f"({exc}). Check that `ssm` is in the AWS services list.")
+                    f"({exc}). Check that `ssm` is in the AWS services list "
+                    f"in config.yml.")
 
     command_id = sent["Command"]["CommandId"]
     deadline = time.time() + timeout
@@ -154,19 +266,19 @@ def resolve_from_test_vm(fqdn, resolver=None, timeout=90):
             break
 
     if not invocation:
-        return [], "The dig probe on the test VM did not return in time."
+        return [], (f"The DNS probe on the test VM did not return within "
+                    f"{timeout}s.")
 
     stdout = (invocation.get("StandardOutputContent") or "").strip()
-    if "__DIG_FAILED__" in stdout or not stdout:
-        return [], (f"`dig {server}{fqdn}` on the test VM returned nothing. "
-                    f"The query is not reaching a server that is authoritative "
-                    f"for {fqdn}.")
+    stderr = (invocation.get("StandardErrorContent") or "").strip()
 
-    answers = [
-        line.strip() for line in stdout.splitlines()
-        if line.strip() and not line.startswith(";")
-    ]
-    return answers, stdout
+    answers = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if answers:
+        return answers, stdout
+
+    where = f"via {resolver}" if resolver else "via the VM's own resolver"
+    return [], (f"{fqdn} did not resolve from inside the VPC {where}. "
+                f"{stderr or 'no output from the probe'}")
 
 
 # --------------------------------------------------------------------------- #

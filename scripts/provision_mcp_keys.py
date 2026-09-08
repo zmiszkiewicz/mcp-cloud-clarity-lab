@@ -1,43 +1,33 @@
 #!/usr/bin/env python3
 """
-Create the participant's two MCP identities and mint a Service API key for each.
+Create the participant's MCP service user and mint its Service API key.
 
-WHY TWO USERS RATHER THAN ONE SERVICE USER WITH TWO KEYS
---------------------------------------------------------
-CSP mints API keys for the *calling* identity — POST /v2/current_api_keys, the
-endpoint the estate's deploy_api_key.py already uses. There is no confirmed
-endpoint for minting a key on behalf of a different user, so rather than guess
-one, this script does what the API actually supports:
+ONE KEY, READ/WRITE.
 
-    for each role (read-only, read/write):
-        create a user in the group carrying that role   (POST /v2/users)
-        set its password                                (POST /v2/users/{id}/password)
-        sign in AS that user                            (POST /v2/session/users/sign_in)
-        switch into the sandbox account                 (POST /v2/session/account_switch)
-        mint a key for itself                           (POST /v2/current_api_keys)
+This used to mint two — a read-only key for Parts 1 and 4, and a read/write key
+handed over at Part 2 — so that the write-safety story was enforced by the
+platform rather than asserted by the prose. It was a nice property and it cost
+too much for what it bought: two CSP users, a key swap at two challenge
+boundaries, and a Claude Code restart each time. Participants hit Part 2 unable
+to make the change the assignment had just told them to make.
 
-Every call above is already in production elsewhere in this estate. The
-read-only/read-write split comes from group membership, which is exactly where
-CSP puts it — so the RBAC lesson in Part 4 is enforced by the platform, not
-simulated by the lab.
+The write-safety lesson survives without it, because the thing actually doing
+the teaching was never the key. It is Claude Code stopping before every tool
+call and making the operator approve it, and the assistant being asked to state
+its intended change first. Both still happen.
 
-The two keys:
+What is lost is Part 4's live access-denied demonstration. That part now uses a
+boundary that is real with any key: account and user administration is not
+exposed through the MCP Server at all, so asking the assistant to create a user
+or change a role fails because the capability does not exist — which is the
+sturdier lesson anyway.
 
-    read-only    Part 1, and the diagnosis half of Part 2; and again for the
-                 RBAC exercise in Part 4
-    read/write   introduced at Part 2 step 2, once the participant has reviewed
-                 the assistant's proposed change and approved it
-
-The Infoblox MCP Server has no dry-run mode — write verbs execute immediately.
-Two keys is how the lab models the right operational pattern rather than just
-describing it. The handover is real: the agent re-reads its key file every turn,
-so 02/setup-shell swapping the file genuinely changes what the agent can do.
-
-Both keys are written mode 0600 and never echoed to stdout.
+To restore the two-key flow, set MCP_ROLES=read_only,read_write; the machinery
+below still supports it.
 
 Usage:
-    python3 provision_mcp_keys.py            create both users + both keys
-    python3 provision_mcp_keys.py --verify   confirm both keys authenticate
+    python3 provision_mcp_keys.py            create the user and its key
+    python3 provision_mcp_keys.py --verify   confirm the key authenticates
 """
 
 import argparse
@@ -52,8 +42,9 @@ from csp_client import (CspClient, CspError, LabTodo, info, ok, read_state,
                         write_state)
 
 
-# The two roles the track needs, and the state-file keys they land in.
-ROLES = {
+# Every role this track knows how to provision. MCP_ROLES selects which of them
+# actually get created — one, by default.
+ALL_ROLES = {
     "read_only": {
         "label": "read-only",
         "user_prefix": "mcp-ro",
@@ -69,10 +60,17 @@ ROLES = {
         "groups": cfg.MCP_RW_GROUPS,
         "group_override": cfg.MCP_RW_GROUP,
         "group_env": "MCP_RW_GROUP",
-        "key_state": "mcp_rw_key",
-        "key_id_state": "mcp_rw_key_id",
+        "key_state": "mcp_key",
+        "key_id_state": "mcp_key_id",
     },
 }
+
+ROLES = {name: ALL_ROLES[name] for name in cfg.MCP_ROLES if name in ALL_ROLES}
+if not ROLES:
+    raise SystemExit(
+        f"❌ MCP_ROLES={cfg.MCP_ROLES} names no known role. "
+        f"Valid: {', '.join(ALL_ROLES)}"
+    )
 
 
 def key_expiry():
@@ -376,7 +374,8 @@ def main():
             write_state(spec["key_state"], key, secret=True)
             spec["_user_id"] = user_id
 
-        # Recorded so revoke_mcp_keys.py can delete both users at teardown.
+        # Recorded so revoke_mcp_keys.py can delete every user at teardown,
+        # however many were created.
         write_state("mcp_service_user_id",
                     ",".join(ROLES[r]["_user_id"] for r in ROLES))
 
