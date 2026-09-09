@@ -307,6 +307,23 @@ Two things run at track start, concurrently:
 Starting the build before the broker call is what keeps the gate cheap: the two
 slow things overlap instead of queueing, so step 9 is usually short.
 
+**Budget roughly 8-13 minutes of track start**, most of it in two places:
+
+| | Typical |
+|---|---|
+| Three SSM interface endpoints, in parallel | 3-5 min |
+| VPN gateway create and attach (`as-a-service` mode only) | 4-6 min |
+| EC2 instance to running | ~1 min |
+| SSM agent registration, plus the probe | 1-3 min |
+
+The wait loop caps at 20 minutes and prints a progress line each minute, with
+the last meaningful line from the terraform log — a silent ten-minute pause is
+indistinguishable from a hang.
+
+**If that is too slow for an event**, the VPN gateway is the thing to remove:
+`LAB_C3_MODE=forwarder` skips it entirely and takes roughly four minutes off
+the start. See "Part 3 delivery modes".
+
 `warm_vpc.py` is the part worth understanding. Creating the test VM is not the
 same as being able to run a command on it — the SSM agent registers a minute or
 two after boot, and until it does every probe sits Pending. So `terraform.done`
