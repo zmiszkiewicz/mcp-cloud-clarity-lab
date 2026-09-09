@@ -219,6 +219,12 @@ STATE_FILES = {
     "mcp_ro_key_id": "mcp_ro_key_id.txt",
     "mcp_ro_key": "mcp_ro_key.txt",
     "vpc_outputs": "vpc_outputs.json",     # terraform output, Part 3
+    # The join token's NAME, not the token. A host enrolled with a token
+    # registers as ZTP_<name>_<suffix>, so this is how niosx_host.py finds its
+    # own host rather than guessing at an address that is not reported for the
+    # first few minutes. The token itself is never written to disk — it goes
+    # straight into TF_VAR_infoblox_join_token and Terraform state.
+    "join_token_name": "join_token_name.txt",
 }
 
 
@@ -411,6 +417,63 @@ SERVICE_IP = os.environ.get("LAB_SERVICE_IP", "10.40.0.53")
 # still works; this is just the value that avoids a needless fallback.
 ENDPOINT_SIZE = os.environ.get("LAB_ENDPOINT_SIZE", "S")
 
+
+# --------------------------------------------------------------------------- #
+# The NIOS-X host
+# --------------------------------------------------------------------------- #
+#
+# A NIOS-X host is an EC2 instance built from a privately shared Infoblox AMI.
+# Its entire bootstrap is a join token: on first boot it calls csp.infoblox.com,
+# registers itself against the tenant that issued the token, and appears under
+# Infrastructure > Hosts. From then on it is managed from the Portal, not from
+# Terraform.
+#
+# THIS IS THE MODEL THAT WORKS. The alternative — NIOS-X as a Service, with
+# universalservices and endpoints in Infoblox points of presence — is refused
+# by a sandbox tenant: every service location this lab tried came back
+# "Service location <x> not supported", because placing an endpoint in a PoP is
+# an entitlement a sandbox does not have. A host in our own VPC needs no PoP.
+#
+# It also answers TODO-09. A registered NIOS-X host IS a Universal DDI host, so
+# LAB_AUTH_MODE=host becomes possible and Part 2 gets a server that genuinely
+# returns NXDOMAIN instead of a server group that only represents one.
+
+# Region-specific, and there is no lookup that finds it: the image is shared
+# privately with this organisation's accounts rather than published, so
+# `aws ec2 describe-images` with an owner filter is the only way to discover a
+# new one and that needs credentials this config does not have.
+#
+# eu-central-1 is the only region with a confirmed image. It is the one four
+# other Infoblox labs in this estate use — tech-summit-security-niosx,
+# app-migration-niosx, nios-rpz-genai-block and the -iracic82 fork — all
+# hardcoding this same AMI. If the image is copied to another region, add it
+# here; a region that is absent disables the host rather than failing the
+# track, because Parts 1, 2 and 4 do not need it.
+NIOSX_AMI_BY_REGION = {
+    "eu-central-1": os.environ.get("LAB_NIOSX_AMI_EU_CENTRAL_1",
+                                   "ami-08659b5070b66249d"),
+}
+
+# An explicit override always wins, so a new image can be tried without editing
+# this file.
+NIOSX_AMI_ID = os.environ.get("LAB_NIOSX_AMI") or NIOSX_AMI_BY_REGION.get(VPC_REGION)
+
+# m5.large matches every other NIOS-X lab in the estate. Smaller has not been
+# tested and this is not the place to find out.
+NIOSX_INSTANCE_TYPE = os.environ.get("LAB_NIOSX_INSTANCE_TYPE", "m5.large")
+
+# Static, because the test VM's resolver has to be set to it and the two must
+# agree without a lookup. Inside the workload subnet, clear of the .1-.4
+# addresses AWS reserves at the bottom of every subnet.
+NIOSX_HOST_IP = os.environ.get("LAB_NIOSX_HOST_IP", "10.40.1.53")
+
+# What the DNS service on the host is called. Recognisable rather than a UUID,
+# because the participant is asked to find it in the Portal.
+DNS_SERVICE_NAME = os.environ.get("LAB_DNS_SERVICE_NAME", "techcorp-ai-vpc-dns")
+
+# Whether a NIOS-X host can be built at all in this region.
+NIOSX_AVAILABLE = bool(NIOSX_AMI_ID)
+
 # Where the check reads the DNS service IP from once it exists. Written by
 # 03/check-shell via terraform output, or by the participant's own work.
 DNS_SERVICE_IP = os.environ.get("LAB_DNS_SERVICE_IP")
@@ -490,6 +553,14 @@ PATHS = {
     # Infrastructure (inframgmt package — base path /api/infra/v1).
     "infra_hosts":        "/api/infra/v1/hosts",
     "infra_services":     "/api/infra/v1/services",
+
+    # The NIOS-X host model, which is what actually works in a sandbox.
+    #
+    # `detail_hosts` carries the pool id that a service must be attached to;
+    # plain `/hosts` does not. `detail_services` is its counterpart for reading
+    # a service's real state back.
+    "detail_hosts":       "/api/infra/v1/detail_hosts",
+    "detail_services":    "/api/infra/v1/detail_services",
     "infra_applications": "/api/infra/v1/applications",
     "infra_detail_hosts": "/api/infra/v1/detail_hosts",
     "infra_detail_services": "/api/infra/v1/detail_services",

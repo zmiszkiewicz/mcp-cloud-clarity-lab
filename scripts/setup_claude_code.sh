@@ -40,8 +40,16 @@ LAB_DIR="${LAB_DIR:-/root/infoblox-lab/mcp-cloud-clarity-lab}"
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-/root/techcorp}"
 KEY_FILE="${AGENT_KEY_FILE:-/opt/lab/mcp_key}"
 MCP_URL="${MCP_SERVER_URL:-https://csp.infoblox.com/mcp}"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+# Bedrock's region, which is NOT the VPC's. The Claude models are enabled in
+# us-east-1; the lab VPC lives wherever the NIOS-X AMI exists, currently
+# eu-central-1. Reading AWS_DEFAULT_REGION here would point Bedrock at a region
+# with no model access and fail every prompt.
+REGION="${BEDROCK_REGION:-us-east-1}"
 MODEL="${ANTHROPIC_MODEL:-us.anthropic.claude-sonnet-4-6}"
+# Where the lab's VPC actually is, which is a different region from Bedrock's.
+# The AWS MCP server acts on that VPC, so pointing it at REGION would have it
+# looking for the VPC in the region where the models live and finding nothing.
+VPC_REGION="${LAB_VPC_REGION:-${AWS_DEFAULT_REGION:-eu-central-1}}"
 
 export PATH="/root/.local/bin:${PATH}"
 
@@ -247,11 +255,11 @@ if [ "${AWS_MCP_ENABLED:-1}" != "0" ]; then
   claude mcp remove aws-api --scope user >/dev/null 2>&1 || true
   if claude mcp add --transport stdio aws-api \
        --scope user \
-       --env AWS_REGION="${REGION}" \
+       --env AWS_REGION="${VPC_REGION}" \
        --env AWS_API_MCP_WORKING_DIR=/opt/lab/aws-mcp \
        --env READ_OPERATIONS_ONLY=false \
        -- uvx awslabs.aws-api-mcp-server@latest >/dev/null 2>&1; then
-    echo "✅ aws-api registered"
+    echo "✅ aws-api registered (acting in ${VPC_REGION})"
   else
     echo "⚠️  could not register the AWS MCP server; Part 3 will not be able to"
     echo "    act on AWS. Parts 1, 2 and 4 are unaffected."

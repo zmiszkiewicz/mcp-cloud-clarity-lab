@@ -24,7 +24,6 @@ findings shape this file and are worth knowing before editing:
 """
 
 import lab_config as cfg
-import service_deployment
 from csp_client import info, object_url, ok
 
 
@@ -487,20 +486,21 @@ def build_all(client):
     set_authoritative_servers(client, zone["id"], authority, attached=True)
     ok(f"{cfg.ZONE_FQDN} is authoritative on {authority['name']}")
 
-    # Part 3's Infoblox side. NON-FATAL: a tenant missing a prerequisite still
-    # gives a working Parts 1, 2 and 4, and failing the whole seed over Part 3
-    # would trade three working challenges for none.
+    # Part 3's DNS server is NOT built here.
+    #
+    # It used to be: scripts/service_deployment.py tried to create a NIOS-X as
+    # a Service deployment over /api/universalinfra. A sandbox tenant cannot
+    # have one — every service location was refused, because placing an
+    # endpoint in an Infoblox point of presence is an entitlement a sandbox
+    # does not get.
+    #
+    # What works instead is a NIOS-X *host*: an EC2 instance in the lab's own
+    # VPC that registers itself with a join token. That needs the VPC to exist,
+    # so it happens in scripts/niosx_host.py, driven from
+    # /opt/lab/build-niosx.sh, concurrently with this seeding rather than
+    # inside it. service_deployment.py is kept for the day a tenant does have
+    # the entitlement.
     service = {}
-    try:
-        service = service_deployment.build(client)
-    except service_deployment.ServiceSeedingUnavailable as exc:
-        print(f"⚠️  Part 3's DNS service was not created: {exc}", flush=True)
-        print("    Parts 1, 2 and 4 are unaffected. Part 3 will say so.",
-              flush=True)
-    except Exception as exc:                            # noqa: BLE001
-        print(f"⚠️  Part 3's DNS service could not be created: {exc}",
-              flush=True)
-        print("    Parts 1, 2 and 4 are unaffected.", flush=True)
 
     print("\n=== Baseline: IPAM / DHCP ===", flush=True)
     space = ensure_ip_space(client)

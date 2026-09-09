@@ -98,3 +98,35 @@ output "vpn_connection_id" {
   description = "Empty until the participant creates the tunnel to the Infoblox point of presence."
   value       = ""
 }
+
+###############################################################################
+# NIOS-X host
+###############################################################################
+# All null when no host was built, which is a legitimate state rather than an
+# error: see the region note on niosx_ami_id. Consumers must handle null.
+
+output "niosx_instance_id" {
+  description = "EC2 instance id of the NIOS-X host, or null if none was built"
+  value       = try(aws_instance.niosx[0].id, null)
+}
+
+output "niosx_private_ip" {
+  description = "Private address the host serves DNS on — what the VPC must be pointed at"
+  value       = try(var.niosx_host_ip, null)
+}
+
+output "niosx_public_ip" {
+  description = "Elastic IP of the NIOS-X host: its path to csp.infoblox.com, and support access"
+  value       = try(aws_eip.niosx[0].public_ip, null)
+}
+
+output "niosx_enabled" {
+  description = "Whether a NIOS-X host was built at all in this region"
+
+  # Counted resources rather than local.niosx_enabled: that local is derived
+  # from the join token, which is sensitive, so the boolean inherits its
+  # sensitivity and Terraform refuses to output it. Counting what was actually
+  # created says the same thing and is the more honest signal anyway — it
+  # reports the result rather than the intent.
+  value = length(aws_instance.niosx) > 0
+}
