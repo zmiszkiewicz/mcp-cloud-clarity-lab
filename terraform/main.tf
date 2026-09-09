@@ -231,14 +231,18 @@ resource "aws_instance" "test_vm" {
   # did, and each was wrong. Console output needs nothing on the instance role,
   # no log group, no agent, and it works precisely when SSM does not.
   #
-  # `$${...}` is an ESCAPED dollar sign. Terraform interpolates `${...}` inside a
-  # heredoc, so an unescaped bash variable here is a plan-time error.
+  # ESCAPING: Terraform templates BOTH `${...}` and `%{...}` inside a heredoc,
+  # so a bash variable must be written `$${...}` and a curl format string
+  # `%%{http_code}`. An unescaped one of either is a plan-time error — and the
+  # `%{` case is easy to miss, because it only appears in the curl line.
+  # `${var.region}` below is a real interpolation and is deliberately unescaped.
   user_data = <<-EOT
     #!/bin/bash
     echo "techcorp ai workload test host" > /etc/motd
+    REGION=${var.region}
 
     (
-      for delay in 60 120 240; do
+      for delay in 30 45 60 120 240; do
         sleep $${delay}
         {
           echo "=== LAB_SSM_DIAG start (uptime $${SECONDS}s) ==="
@@ -248,6 +252,12 @@ resource "aws_instance" "test_vm" {
           tail -n 25 /var/log/amazon/ssm/amazon-ssm-agent.log 2>&1
           echo "-- agent errors --"
           tail -n 15 /var/log/amazon/ssm/errors.log 2>&1
+          echo "-- can the agent reach its endpoints? --"
+          for host in ssm ssmmessages ec2messages; do
+            code=$(curl -s -o /dev/null -w '%%{http_code}' --max-time 5 \
+                   "https://$${host}.$${REGION}.amazonaws.com/" 2>&1)
+            echo "  $${host}: HTTP $${code}"
+          done
           echo "=== LAB_SSM_DIAG end ==="
         } > /dev/console 2>&1
       done
