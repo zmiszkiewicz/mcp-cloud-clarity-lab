@@ -238,6 +238,7 @@ def ensure_user(admin, name, email, group_ids, password):
     """
     existing = (admin.find_by_name(cfg.path("users"), email, field="email")
                 or admin.find_by_name(cfg.path("users"), name))
+    created_now = not existing
     if existing:
         user_id = existing["id"].split("/")[-1]
         info(f"user {email} already exists ({user_id}), reusing it")
@@ -253,16 +254,25 @@ def ensure_user(admin, name, email, group_ids, password):
             raise SystemExit(f"❌ user create for {name} returned no id: {created}")
         ok(f"created user {name} ({user_id})")
 
-    # Re-assert group membership on every run. A re-run is usually BECAUSE the
-    # roles changed, so leaving an existing user's groups alone would defeat
-    # the point of re-running.
-    if group_ids:
-        try:
-            admin.patch(f"{cfg.path('users')}/{user_id}",
-                        json_body={"group_ids": group_ids})
-            info(f"group membership re-asserted for {email}")
-        except CspError as exc:
-            print(f"⚠️  could not update groups for {email}: {exc}", flush=True)
+    # DELIBERATELY DOES NOT TOUCH GROUPS ON AN EXISTING USER.
+    #
+    # An earlier version PATCHed group_ids here to "re-assert" membership. That
+    # is a REPLACE, not an add — so on a user whose roles had been adjusted by
+    # hand in the Portal it would silently discard the adjustment, which is
+    # precisely the thing someone re-running this script is trying to keep.
+    #
+    # CSP also enforces account invariants that a blind replace trips:
+    #
+    #   cannot remove last ib-access-control-admin from the account
+    #
+    # There is no reliable read-back of a user's membership either
+    # (GET /v2/users/{id} does not return group_ids), so a safe union cannot be
+    # computed from here. Leaving it alone is correct: the user was created
+    # with the right groups, and any later change was deliberate.
+    if not created_now and group_ids:
+        info(f"leaving existing group membership alone for {email}")
+        info("  (to change roles, edit the user in the Portal: "
+             "System > User Access > Users)")
 
     # Always (re)set the password — we need to know it to sign in as this user,
     # and on a re-run we do not have the one from last time.
@@ -309,8 +319,14 @@ def mint_key_as_user(email, password, account_id, label):
     user_client.switch_account(account_id)
 
     expires_at = key_expiry()
+
+    # The name must be UNIQUE per mint. CSP rejects a duplicate with
+    #   409 "HTTP interceptor error:  already exists"
+    # so a constant name makes this script single-use — and re-running it is
+    # exactly what you do after changing a role and wanting a fresh key.
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%m%d%H%M%S")
     created = user_client.post(cfg.path("current_api_keys"), json_body={
-        "name": f"mcp-{label.replace('/', '-')}-{cfg.PARTICIPANT_ID}",
+        "name": f"mcp-{label.replace('/', '-')}-{cfg.PARTICIPANT_ID}-{stamp}",
         # Required. See key_expiry() — omitting this is a 400, not a default.
         "expires_at": expires_at,
     })
