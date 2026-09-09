@@ -61,6 +61,17 @@ STATUS_FILE = os.environ.get("LAB_VPC_STATUS", "/opt/lab/vpc_status.json")
 # is going to register does so in a minute or two; five is generous.
 SSM_WAIT_SECONDS = int(os.environ.get("LAB_SSM_WAIT", "300"))
 
+# Whether an unusable test VM stops the track starting.
+#
+# Default 1: Part 3's check runs a command on that VM, so without it the
+# challenge cannot be completed, and failing at boot costs a restart rather
+# than half an hour of the participant's work.
+#
+# Set LAB_REQUIRE_TEST_VM=0 to downgrade it to a warning — useful when you want
+# to run Parts 1, 2 and 4 while the VM is still being diagnosed. Part 3 will
+# still fail; it will just fail there instead of here.
+REQUIRE_TEST_VM = os.environ.get("LAB_REQUIRE_TEST_VM", "1") not in ("0", "false")
+
 
 def write_status(**fields):
     os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
@@ -98,10 +109,24 @@ def main():
     can_run, exec_detail = cloud_vpc.test_vm_can_run_commands(instance)
     print(f"   exec: {exec_detail}", flush=True)
     if not can_run:
+        # Four theories about this have each been wrong. Print the facts.
+        print("\n--- test VM diagnosis ---", flush=True)
+        try:
+            print(cloud_vpc.diagnose_test_vm(instance), flush=True)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"   diagnosis failed: {exc}", flush=True)
+        print("-------------------------\n", flush=True)
+
         write_status(ready=False, ssm=status, exec=exec_detail, probe="skipped",
-                     fatal=True,
+                     fatal=REQUIRE_TEST_VM,
                      detail=f"The test VM cannot run the Part 3 probe: "
                             f"{exec_detail}")
+        if not REQUIRE_TEST_VM:
+            print("⚠️  LAB_REQUIRE_TEST_VM=0 — continuing anyway. Parts 1, 2 "
+                  "and 4 will work; Part 3 will not.", flush=True)
+            return 0
+        print("   Set LAB_REQUIRE_TEST_VM=0 to start the track anyway and run "
+              "Parts 1, 2 and 4 while this is diagnosed.", flush=True)
         return 1
 
     # -- 3. Warm-up query. Informative, not fatal. --------------------------

@@ -371,10 +371,34 @@ by default. Three fewer resources and about a minute off the build.
 **The VM still has no inbound access** — its security group opens nothing, there
 is no SSH key, and SSM Run Command is the only way in.
 
-If a future version wants the private-subnet story back, the endpoints need
-diagnosing from inside the VM (`amazon-ssm-agent` logs in
-`/var/log/amazon/ssm/`), which needs a way in that does not depend on the thing
-being diagnosed.
+**This is still not fixed.** The public subnet did not resolve it either:
+`PingStatus: Online`, Run Command still `Pending`. Four theories, four
+restarts, four wrong.
+
+What the next run will establish, rather than guess:
+
+- `ssm_instance_info()` now matches the record by **InstanceId** instead of
+  taking row `[0]` of a filtered list. If the filter was ever not applied as
+  expected, the old code reported an unrelated instance's ping status as ours —
+  which would produce precisely this symptom.
+- `run_on_test_vm()` polls for **longer than SSM's own `TimeoutSeconds`**, so
+  SSM gets to say `DeliveryTimedOut` ("the agent never collected it") instead
+  of us giving up first and reporting an ambiguous `Pending`.
+- `diagnose_test_vm()` prints the facts on failure: instance state, AMI, public
+  IP, instance profile, SSM ping/agent/platform, and every managed instance in
+  the account.
+
+### Unblocking while it is diagnosed
+
+```bash
+instruqt secrets create --name LAB_REQUIRE_TEST_VM --value 0
+```
+
+Downgrades the VM check to a warning so the track starts. Parts 1, 2 and 4 work
+normally; Part 3 fails at its own check instead of at boot.
+
+`LAB_C3_MODE=forwarder` is the other lever — it drops the VPN gateway and takes
+about four minutes off the build, though it does not touch this problem.
 
 ## The DNS probe is pure Python, not `dig`
 

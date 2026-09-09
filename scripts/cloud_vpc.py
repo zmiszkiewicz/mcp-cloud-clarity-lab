@@ -184,24 +184,61 @@ for a in answers:
 '''
 
 
-def ssm_registered(instance_id, wait=0):
+def ssm_instance_info(instance_id):
     """
-    Is the VM actually managed by SSM? Optionally wait for it to become so.
+    The SSM registration record for THIS instance, or None.
 
-    Worth asking separately. Without it, a VM that has not registered produces
-    a command that sits Pending until the caller's timeout, and the resulting
-    "did not return in time" tells you nothing about why.
+    Matches on InstanceId explicitly rather than trusting the filter and taking
+    row [0]. The old version did the latter, which is only correct if the
+    filter is applied as expected — and if it ever is not, it reports the ping
+    status of some unrelated instance in the account as though it were ours.
+    That would produce exactly the symptom we have been chasing: a confident
+    "Online" for a VM whose agent has never checked in.
     """
     ssm = _client("ssm")
+    rows = ssm.describe_instance_information(Filters=[
+        {"Key": "InstanceIds", "Values": [instance_id]},
+    ])["InstanceInformationList"]
+
+    for row in rows:
+        if row.get("InstanceId") == instance_id:
+            return row
+
+    # Nothing matched. Say what the filter DID return, because "the filter is
+    # not doing what I think" is a real possibility worth ruling out.
+    if rows:
+        others = ", ".join(r.get("InstanceId", "?") for r in rows[:5])
+        raise LookupError(
+            f"the SSM filter returned {len(rows)} record(s) but none for "
+            f"{instance_id} — got: {others}"
+        )
+    return None
+
+
+def ssm_registered(instance_id, wait=0):
+    """
+    Is THIS VM managed by SSM, and currently Online? Optionally wait for it.
+
+    Returns (bool, detail) where detail carries the agent version and last ping
+    when known, because "Online" alone has repeatedly turned out to be true and
+    unhelpful.
+    """
     deadline = time.time() + max(wait, 0)
     while True:
         try:
-            info_rows = ssm.describe_instance_information(Filters=[
-                {"Key": "InstanceIds", "Values": [instance_id]},
-            ])["InstanceInformationList"]
-            if info_rows and info_rows[0].get("PingStatus") == "Online":
-                return True, "Online"
-            status = info_rows[0].get("PingStatus") if info_rows else "not registered"
+            row = ssm_instance_info(instance_id)
+            if row is None:
+                status = "not registered with SSM at all"
+            else:
+                ping = row.get("PingStatus")
+                last = row.get("LastPingDateTime")
+                agent = row.get("AgentVersion", "?")
+                status = (f"{ping} (agent {agent}, "
+                          f"last ping {last:%H:%M:%S}" if last else
+                          f"{ping} (agent {agent}")
+                status += ")"
+                if ping == "Online":
+                    return True, status
         except Exception as exc:                        # noqa: BLE001
             status = f"lookup failed: {exc}"
         if time.time() >= deadline:
@@ -209,7 +246,64 @@ def ssm_registered(instance_id, wait=0):
         time.sleep(5)
 
 
-def run_on_test_vm(command, timeout=120, instance_id=None):
+def diagnose_test_vm(instance_id=None):
+    """
+    Everything knowable about the VM from outside it, in one block.
+
+    Exists because four separate theories about why Run Command sits in
+    Pending have each been wrong, and each cost a track restart to disprove.
+    Printing the facts once is cheaper than another round of hypotheses.
+    """
+    instance_id = instance_id or test_vm_instance_id()
+    lines = [f"instance: {instance_id}"]
+
+    try:
+        ec2 = _client("ec2")
+        reservations = ec2.describe_instances(
+            InstanceIds=[instance_id])["Reservations"]
+        inst = reservations[0]["Instances"][0]
+        profile = (inst.get("IamInstanceProfile") or {}).get("Arn", "NONE")
+        lines += [
+            f"  state:          {inst['State']['Name']}",
+            f"  ami:            {inst.get('ImageId')}",
+            f"  public ip:      {inst.get('PublicIpAddress', 'NONE')}",
+            f"  subnet:         {inst.get('SubnetId')}",
+            f"  instance profile: {profile.rsplit('/', 1)[-1]}",
+            f"  launched:       {inst.get('LaunchTime')}",
+        ]
+    except Exception as exc:                            # noqa: BLE001
+        lines.append(f"  EC2 lookup failed: {exc}")
+
+    try:
+        row = ssm_instance_info(instance_id)
+        if row is None:
+            lines.append("  SSM: NOT REGISTERED — the agent has never checked in")
+        else:
+            lines += [
+                f"  SSM ping:       {row.get('PingStatus')}",
+                f"  SSM last ping:  {row.get('LastPingDateTime')}",
+                f"  SSM agent:      {row.get('AgentVersion')} "
+                f"(latest={row.get('IsLatestVersion')})",
+                f"  SSM platform:   {row.get('PlatformName')} "
+                f"{row.get('PlatformVersion')}",
+            ]
+    except Exception as exc:                            # noqa: BLE001
+        lines.append(f"  SSM lookup failed: {exc}")
+
+    # Every managed instance in the account, to show whether the filter above
+    # is telling the truth.
+    try:
+        ssm = _client("ssm")
+        allrows = ssm.describe_instance_information()["InstanceInformationList"]
+        lines.append(f"  managed instances in this account: "
+                     f"{[r.get('InstanceId') for r in allrows][:8]}")
+    except Exception as exc:                            # noqa: BLE001
+        lines.append(f"  account-wide SSM listing failed: {exc}")
+
+    return "\n".join(lines)
+
+
+def run_on_test_vm(command, timeout=180, instance_id=None):
     """
     Run one shell command on the test VM. Returns a result dict:
 
@@ -233,7 +327,11 @@ def run_on_test_vm(command, timeout=120, instance_id=None):
             InstanceIds=[instance_id],
             DocumentName="AWS-RunShellScript",
             Parameters={"commands": [command]},
-            TimeoutSeconds=60,
+            # SSM marks a command DeliveryTimedOut once this elapses without
+            # the agent collecting it. We poll for LONGER than this on purpose:
+            # racing it produced an ambiguous "Pending" where SSM would have
+            # told us plainly that the agent never picked the command up.
+            TimeoutSeconds=120,
         )
     except Exception as exc:                            # noqa: BLE001
         return {"ok": False, "status": "send-failed", "rc": None,
@@ -287,7 +385,7 @@ def run_on_test_vm(command, timeout=120, instance_id=None):
             "stdout": stdout, "stderr": stderr, "detail": detail}
 
 
-def test_vm_can_run_commands(instance_id=None, attempts=3, timeout=60):
+def test_vm_can_run_commands(instance_id=None, attempts=2, timeout=150):
     """
     Can we execute anything at all on the VM, and is python3 there?
 
