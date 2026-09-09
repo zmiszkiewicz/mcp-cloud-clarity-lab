@@ -70,6 +70,7 @@ SSM_WAIT_SECONDS = int(os.environ.get("LAB_SSM_WAIT", "300"))
 # Set LAB_REQUIRE_TEST_VM=0 to downgrade it to a warning — useful when you want
 # to run Parts 1, 2 and 4 while the VM is still being diagnosed. Part 3 will
 # still fail; it will just fail there instead of here.
+LAB_REQUIRE_TEST_VM=0
 REQUIRE_TEST_VM = os.environ.get("LAB_REQUIRE_TEST_VM", "1") not in ("0", "false")
 
 
