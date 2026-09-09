@@ -266,12 +266,23 @@ def run_on_test_vm(command, timeout=120, instance_id=None):
     if not stdout and not stderr:
         detail += " (both streams empty)"
 
+    # Pending at the deadline means the agent never picked the command up, which
+    # is a different fault from one that ran and failed. Say so, because the
+    # remedy is different too.
+    if status == "Pending":
+        detail += (" — the SSM agent accepted the command but never ran it. "
+                   "The instance registers over the `ssm` endpoint but Run "
+                   "Command is delivered over `ssmmessages`; this is what it "
+                   "looks like when that channel is not established, usually "
+                   "because the VM booted before the interface endpoints "
+                   "existed")
+
     return {"ok": status == "Success" and rc == 0,
             "status": status, "rc": rc,
             "stdout": stdout, "stderr": stderr, "detail": detail}
 
 
-def test_vm_can_run_commands(instance_id=None):
+def test_vm_can_run_commands(instance_id=None, attempts=3, timeout=60):
     """
     Can we execute anything at all on the VM, and is python3 there?
 
@@ -280,22 +291,42 @@ def test_vm_can_run_commands(instance_id=None):
     whether a *public* name resolves at boot is a convenience, and not even the
     path Part 3 exercises. Conflating them meant a public-DNS quirk failed the
     whole track start.
-    """
-    result = run_on_test_vm(
-        "echo LAB_EXEC_OK; python3 -c 'import sys; print(sys.version.split()[0])'",
-        instance_id=instance_id,
-    )
-    if not result["ok"]:
-        return False, f"could not run a command on the VM — {result['detail']}"
-    if "LAB_EXEC_OK" not in result["stdout"]:
-        return False, (f"command ran but produced unexpected output — "
-                       f"{result['detail']} stdout={result['stdout'][:200]!r}")
 
-    version = [l for l in result["stdout"].splitlines() if l != "LAB_EXEC_OK"]
-    if not version:
-        return False, ("python3 is not available on the test VM. The DNS probe "
-                       "needs it, and the subnet has no internet to install it.")
-    return True, f"commands run; python3 {version[0]}"
+    RETRIED, because the failure it guards against is a timing one. The SSM
+    agent's control channel can take a little while to establish after the
+    interface endpoints come up, and a single attempt turns "not ready yet"
+    into "will never work". Terraform now boots the VM after the endpoints
+    exist, which should make the first attempt succeed; these retries are what
+    stops a slow agent failing a whole track start anyway.
+    """
+    last = "no attempt made"
+    for attempt in range(1, attempts + 1):
+        result = run_on_test_vm(
+            "echo LAB_EXEC_OK; python3 -c 'import sys; print(sys.version.split()[0])'",
+            timeout=timeout, instance_id=instance_id,
+        )
+
+        if result["ok"] and "LAB_EXEC_OK" in result["stdout"]:
+            version = [l for l in result["stdout"].splitlines()
+                       if l != "LAB_EXEC_OK"]
+            if not version:
+                # A hard no: nothing about waiting longer installs python3, and
+                # the subnet has no internet to fetch it.
+                return False, ("python3 is not available on the test VM. The "
+                               "DNS probe needs it, and the subnet has no "
+                               "internet to install it. A different AMI or a "
+                               "NAT gateway would be required.")
+            return True, f"commands run; python3 {version[0]}"
+
+        last = result["detail"]
+        if result["status"] not in ("Pending", "InProgress", "Delayed",
+                                    "no-invocation"):
+            # Ran and genuinely failed. Retrying will not change the answer.
+            break
+        if attempt < attempts:
+            info(f"    attempt {attempt}: {last} — retrying")
+
+    return False, f"could not run a command on the VM — {last}"
 
 
 def resolve_from_test_vm(fqdn, resolver=None, timeout=120, ssm_wait=0):

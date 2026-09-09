@@ -196,8 +196,27 @@ resource "aws_instance" "test_vm" {
     echo "techcorp ai workload test host" > /etc/motd
   EOT
 
-  # The instance is registered with SSM at boot and its metadata changes as
-  # tags are applied. Without this a later apply wants to rebuild it.
+  # BOOT AFTER THE ENDPOINTS EXIST. Not a nicety — this was the bug.
+  #
+  # Terraform creates the instance in ~13s and the SSM interface endpoints in
+  # ~55s, so by default the VM boots forty seconds before there is anything for
+  # its agent to talk to. With no internet gateway there is no fallback: the
+  # agent's first attempts fail and it enters backoff.
+  #
+  # It recovers enough to register — describe_instance_information reports
+  # PingStatus Online — but the ssmmessages control channel, which is what
+  # actually delivers Run Command, does not establish. Commands are accepted
+  # and then sit in Pending forever, which is precisely the symptom:
+  #
+  #     SSM: Online
+  #     exec: status=Pending rc=-1 (both streams empty)
+  #
+  # "Registered" and "can be commanded" are different states, and only the
+  # second one matters here.
+  depends_on = [aws_vpc_endpoint.ssm]
+
+  # The instance registers with SSM at boot and its metadata changes as tags
+  # are applied. Without this a later apply wants to rebuild it.
   lifecycle {
     ignore_changes = [ami, user_data]
   }

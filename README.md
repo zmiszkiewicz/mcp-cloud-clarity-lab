@@ -341,6 +341,35 @@ that would let a broken lab through.
 VPC identifiers. It is fatal if the status says not-ready, but by construction
 that should never fire — it catches a VM that broke *between* boot and Part 3.
 
+## "Registered with SSM" is not "can be commanded"
+
+Two different states, and the lab needs the second one.
+
+Terraform creates the test VM in about 13 seconds and the SSM interface
+endpoints in about 55. Left to itself it therefore boots the VM **forty seconds
+before there is anything for its agent to talk to** — and with no internet
+gateway there is no fallback, so the agent's first attempts fail and it enters
+backoff.
+
+It recovers far enough to register: `describe_instance_information` reports
+`PingStatus: Online`. But registration happens over the `ssm` endpoint, while
+Run Command is delivered over `ssmmessages`, and that channel does not
+establish. Commands are accepted and then sit in `Pending` forever:
+
+```
+SSM: Online
+exec: status=Pending rc=-1 (both streams empty)
+```
+
+Two fixes, because one is structural and the other is about timing:
+
+- `aws_instance.test_vm` has `depends_on = [aws_vpc_endpoint.ssm]`, so the VM
+  boots into a VPC where the endpoints already exist. This costs ~40s of build
+  time and removes the cause.
+- `test_vm_can_run_commands()` retries a `Pending` result, because agent
+  readiness is inherently a race. It does **not** retry a command that ran and
+  failed, or a missing python3 — waiting longer cannot fix either.
+
 ## The Part 3 test VM has no internet, and that shapes the probe
 
 The workload subnet has no internet gateway and no NAT, deliberately — it is
