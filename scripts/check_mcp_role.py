@@ -55,15 +55,27 @@ def report_groups(admin):
             continue
 
         user = payload.get("result", payload)
-        names = [groups_by_id.get(gid, gid) for gid in user.get("group_ids", [])]
         print(f"\n  user:   {user.get('name')} ({user_id})")
-        print(f"  groups: {', '.join(names) or '(none)'}")
+
+        # GET /v2/users/{id} does NOT reliably return group_ids. An empty list
+        # here means "not reported", not "no groups" — and reporting it as the
+        # latter sent a real investigation down a false path once already.
+        if "group_ids" not in user:
+            print("  groups: not reported by this endpoint")
+            print("  → cannot confirm role membership from here. Check the "
+                  "Portal: System > User Access > Users. Note that if the user "
+                  "truly had no MCP group the server would refuse the "
+                  "connection, so a working read proves one is present.")
+            continue
+
+        names = [groups_by_id.get(gid, gid) for gid in user.get("group_ids") or []]
+        print(f"  groups: {', '.join(names) or '(none reported)'}")
 
         mcp = [n for n in names if n and "mcp" in n.lower()]
         if not mcp:
-            print("  ⚠️  NO MCP GROUP. The server would refuse the connection "
-                  "outright, so this is not the current symptom — but it is "
-                  "wrong.")
+            print("  ⚠️  no MCP group in the reported list. Treat with "
+                  "suspicion rather than as fact — a working MCP read proves "
+                  "one exists.")
         elif any("admin" in n.lower() for n in mcp):
             print("  → holds an MCP ADMIN role, so a read-only key is NOT the "
                   "explanation for a refused write.")
