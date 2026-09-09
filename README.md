@@ -395,6 +395,27 @@ A related trap in the same family: `rc=$?` inside `if ! cmd; then` captures the
 status of the negation, not the command — it is always 0, which produces a
 cheerful "failed (exit 0)". Use `cmd; rc=$?` instead.
 
+### The fourth face: a bare `cd` leaking into the next step
+
+Reordering track setup so the VPC build started before the sandbox allocation
+left the shell in `terraform/`. `allocation_subtenant.py` writes
+`sandbox_id.txt` and `sandbox_name.txt` **relative to the working directory**,
+so they landed there — and the track died two lines later on
+`cat: sandbox_name.txt: No such file`, having just printed a cheerful
+"Sandbox Allocation Complete".
+
+Two rules, both now in `track_scripts/setup-shell`:
+
+- **A `cd` needed by one step goes in a subshell.** `( cd dir && cmd )` cannot
+  move the caller. A bare `cd` is a side effect on every step that follows.
+- **Any step whose script writes state relative to cwd re-establishes cwd
+  itself** and then asserts the files landed, rather than trusting whatever ran
+  before it.
+
+The assertion matters as much as the fix. Allocation succeeding and the state
+being findable are different facts, and reporting them as one is how a
+five-second mistake becomes a twenty-minute hunt.
+
 ### And the third face of it: `set-workdir` beats a tab's `workdir`
 
 Because `set-workdir` writes its `cd` into `/root/.bashrc`, it applies to
