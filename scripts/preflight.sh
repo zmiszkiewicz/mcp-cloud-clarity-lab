@@ -181,6 +181,17 @@ PY
 if [ $? -eq 0 ]; then pass "object_url normalises both id forms"; else fail "object_url is wrong"; fi
 
 # --------------------------------------------------------------------------- #
+step "No env var shadowed by a bare Python assignment"
+# `LAB_REQUIRE_TEST_VM=0` at module scope binds a Python variable and does NOT
+# set an environment variable, so the os.environ.get() below it keeps its
+# default. It looks like configuration and does nothing.
+if python3 check_env_shadowing.py; then
+  pass "no env var is shadowed"
+else
+  fail "an env var is shadowed by a Python assignment"
+fi
+
+# --------------------------------------------------------------------------- #
 step "API key expiry format"
 # This exact format is what CSP accepts on POST /v2/current_api_keys. Getting it
 # wrong returns a 400 that names neither the field nor the expectation, so it is

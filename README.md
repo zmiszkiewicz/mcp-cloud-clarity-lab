@@ -390,12 +390,22 @@ What the next run will establish, rather than guess:
 
 ### Unblocking while it is diagnosed
 
+**`REQUIRE_TEST_VM_DEFAULT` in `scripts/warm_vpc.py` is currently `"0"`**, so
+the track starts and Parts 1, 2 and 4 work normally; Part 3 fails at its own
+check instead of at boot. Put it back to `"1"` once the test VM is reliable.
+
+An Instruqt secret overrides the file if you prefer:
+
 ```bash
 instruqt secrets create --name LAB_REQUIRE_TEST_VM --value 0
 ```
 
-Downgrades the VM check to a warning so the track starts. Parts 1, 2 and 4 work
-normally; Part 3 fails at its own check instead of at boot.
+> Editing the file works, but **not** by writing `LAB_REQUIRE_TEST_VM=0` above
+> the `os.environ.get()` call — that binds a Python variable and leaves the
+> environment untouched, so the default still wins. It looks like configuration
+> and does nothing. `scripts/check_env_shadowing.py` now fails preflight on
+> exactly that pattern, while leaving the correct
+> `X = os.environ.get("X", ...)` idiom alone.
 
 `LAB_C3_MODE=forwarder` is the other lever — it drops the VPN gateway and takes
 about four minutes off the build, though it does not touch this problem.

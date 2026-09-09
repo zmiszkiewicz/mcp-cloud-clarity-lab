@@ -67,11 +67,24 @@ SSM_WAIT_SECONDS = int(os.environ.get("LAB_SSM_WAIT", "300"))
 # challenge cannot be completed, and failing at boot costs a restart rather
 # than half an hour of the participant's work.
 #
-# Set LAB_REQUIRE_TEST_VM=0 to downgrade it to a warning — useful when you want
-# to run Parts 1, 2 and 4 while the VM is still being diagnosed. Part 3 will
-# still fail; it will just fail there instead of here.
-LAB_REQUIRE_TEST_VM=0
-REQUIRE_TEST_VM = os.environ.get("LAB_REQUIRE_TEST_VM", "1") not in ("0", "false")
+# ---- EDIT THIS LINE to change the behaviour without an Instruqt secret ----
+#   "1"  an unusable test VM fails the track start   (the strict default)
+#   "0"  it becomes a warning; the track starts and Parts 1, 2 and 4 work,
+#        and Part 3 fails at its own check instead of at boot
+#
+# Currently "0" while the SSM Run Command problem is being diagnosed. Put it
+# back to "1" once the test VM is reliable.
+#
+# NOTE FOR ANYONE EDITING THIS: writing `LAB_REQUIRE_TEST_VM=0` above the
+# os.environ.get() line does nothing. That creates a Python variable; it does
+# not set an environment variable, so the get() below still returns its
+# default. Change REQUIRE_TEST_VM_DEFAULT, or set the env var properly.
+REQUIRE_TEST_VM_DEFAULT = "0"
+
+# The environment still wins, so an Instruqt secret can override the file.
+REQUIRE_TEST_VM = os.environ.get(
+    "LAB_REQUIRE_TEST_VM", REQUIRE_TEST_VM_DEFAULT
+) not in ("0", "false", "")
 
 
 def write_status(**fields):
@@ -82,6 +95,12 @@ def write_status(**fields):
 
 
 def main():
+    source = ("LAB_REQUIRE_TEST_VM env var"
+              if "LAB_REQUIRE_TEST_VM" in os.environ
+              else "REQUIRE_TEST_VM_DEFAULT in warm_vpc.py")
+    print(f"test VM required for track start: {REQUIRE_TEST_VM}  "
+          f"(from {source})", flush=True)
+
     instance = cloud_vpc.test_vm_instance_id()
     if not instance:
         write_status(ready=False, ssm="no test VM found", exec="skipped",
