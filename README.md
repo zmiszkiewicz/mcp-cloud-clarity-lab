@@ -341,51 +341,51 @@ that would let a broken lab through.
 VPC identifiers. It is fatal if the status says not-ready, but by construction
 that should never fire — it catches a VM that broke *between* boot and Part 3.
 
-## "Registered with SSM" is not "can be commanded"
+## The test VM reaches SSM over the internet, and here is why
 
-Two different states, and the lab needs the second one.
+It began in a private subnet with three SSM interface endpoints and no internet
+gateway, because that is what a real workload subnet looks like. That decision
+cost three debugging cycles and never once worked:
 
-Terraform creates the test VM in about 13 seconds and the SSM interface
-endpoints in about 55. Left to itself it therefore boots the VM **forty seconds
-before there is anything for its agent to talk to** — and with no internet
-gateway there is no fallback, so the agent's first attempts fail and it enters
-backoff.
+| Attempt | Symptom | What it turned out to be |
+|---|---|---|
+| 1 | probe timed out | `dig` was never installed — no internet to install it |
+| 2 | `SSM: Online`, `status=Pending` | VM booted 40s before the endpoints existed |
+| 3 | `SSM: Online`, `status=Pending` | still, with the ordering fixed. Undiagnosable from outside |
 
-It recovers far enough to register: `describe_instance_information` reports
-`PingStatus: Online`. But registration happens over the `ssm` endpoint, while
-Run Command is delivered over `ssmmessages`, and that channel does not
-establish. Commands are accepted and then sit in `Pending` forever:
+`PingStatus: Online` proves the agent registered over the `ssm` endpoint. Run
+Command is delivered over a separate `ssmmessages` control channel, and that
+one never established — so commands were accepted and then sat in `Pending`
+forever.
 
-```
-SSM: Online
-exec: status=Pending rc=-1 (both streams empty)
-```
+**The realism was not worth it.** Nothing this lab teaches depends on the test
+VM being in a private subnet: Part 3 asks whether a workload in this VPC can
+resolve an internal name through Infoblox, and that question is identical either
+way. What it does depend on is running one command on that VM, reliably, every
+time.
 
-Two fixes, because one is structural and the other is about timing:
+So the VPC now has an internet gateway and the workload subnet assigns public
+IPs. SSM works over its public endpoints, which is the configuration it works in
+by default. Three fewer resources and about a minute off the build.
 
-- `aws_instance.test_vm` has `depends_on = [aws_vpc_endpoint.ssm]`, so the VM
-  boots into a VPC where the endpoints already exist. This costs ~40s of build
-  time and removes the cause.
-- `test_vm_can_run_commands()` retries a `Pending` result, because agent
-  readiness is inherently a race. It does **not** retry a command that ran and
-  failed, or a missing python3 — waiting longer cannot fix either.
+**The VM still has no inbound access** — its security group opens nothing, there
+is no SSH key, and SSM Run Command is the only way in.
 
-## The Part 3 test VM has no internet, and that shapes the probe
+If a future version wants the private-subnet story back, the endpoints need
+diagnosing from inside the VM (`amazon-ssm-agent` logs in
+`/var/log/amazon/ssm/`), which needs a way in that does not depend on the thing
+being diagnosed.
 
-The workload subnet has no internet gateway and no NAT, deliberately — it is
-what a real private workload subnet looks like, and it is why the SSM interface
-endpoints exist.
+## The DNS probe is pure Python, not `dig`
 
-The consequence is easy to miss: **you cannot install anything on that VM.** An
-earlier build ran `dnf install -y bind-utils` in `user_data` to get `dig`. That
-could never have worked, and Amazon Linux 2023 does not ship bind-utils, so the
-DNS probe was calling a binary that was not there — which surfaced as an
-ambiguous SSM timeout rather than "command not found".
+`cloud_vpc._DNS_PROBE` is a UDP DNS client written in the Python standard
+library, shipped to the VM over SSM and run with AL2023's preinstalled python3.
 
-`cloud_vpc._DNS_PROBE` is a UDP DNS client in the Python standard library,
-shipped to the VM over SSM and run with the preinstalled python3. It needs no
-packages and, unlike `getent hosts`, it can be pointed at a specific resolver —
-which Part 3 needs, since the question is whether one particular DNS service
+It stays that way even now the VM has internet. Amazon Linux 2023 does not ship
+`bind-utils`, so using `dig` would mean installing a package at boot and hoping
+it succeeded — one more thing between the check and its answer. The Python
+client needs nothing, and unlike `getent hosts` it can be pointed at a specific
+resolver, which Part 3 needs: the question is whether one particular DNS service
 answers.
 
 `ssm_registered()` is checked before every probe, because "SSM cannot reach the

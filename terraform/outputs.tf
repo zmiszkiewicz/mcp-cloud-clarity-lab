@@ -33,7 +33,7 @@ output "workload_subnet_ids" {
 }
 
 output "route_table_id" {
-  value = aws_route_table.private.id
+  value = aws_route_table.workload.id
 }
 
 output "test_vm_instance_id" {

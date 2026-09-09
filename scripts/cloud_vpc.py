@@ -15,6 +15,11 @@ an SSM agent and an instance profile anyway to be a realistic workload. If
 `ssm` is missing from the `services:` list in config.yml, every probe here
 degrades to "could not reach the test VM" rather than a false failure.
 
+The VM reaches SSM over the PUBLIC endpoints, via an internet gateway. It was
+originally in a private subnet with three SSM interface endpoints, which is more
+realistic and cost three debugging cycles without ever working — see the note
+above `aws_internet_gateway` in terraform/main.tf.
+
 Nothing here creates infrastructure. Terraform does that at track setup; this
 module only observes.
 """
@@ -271,11 +276,11 @@ def run_on_test_vm(command, timeout=120, instance_id=None):
     # remedy is different too.
     if status == "Pending":
         detail += (" — the SSM agent accepted the command but never ran it. "
-                   "The instance registers over the `ssm` endpoint but Run "
-                   "Command is delivered over `ssmmessages`; this is what it "
-                   "looks like when that channel is not established, usually "
-                   "because the VM booted before the interface endpoints "
-                   "existed")
+                   "The instance can register (PingStatus Online) while still "
+                   "being unable to receive Run Command, so 'registered' and "
+                   "'commandable' are different states. Check that the VM has "
+                   "a public IP and a route to the internet gateway: SSM is "
+                   "reached over the public endpoints in this VPC")
 
     return {"ok": status == "Success" and rc == 0,
             "status": status, "rc": rc,

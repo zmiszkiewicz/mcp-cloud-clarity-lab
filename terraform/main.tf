@@ -62,11 +62,16 @@ resource "aws_subnet" "workload_a" {
   cidr_block        = var.workload_subnet_cidr
   availability_zone = data.aws_availability_zones.available.names[0]
 
+  # Needed so the SSM agent can reach the public SSM endpoints. See the note
+  # above the internet gateway for why this is not the private subnet it was.
+  map_public_ip_on_launch = true
+
   tags = { Name = "${local.vpc_name}-workload-a" }
 }
 
-# Route 53 Resolver endpoints require two subnets in different availability
-# zones. Created in both modes so switching LAB_C3_MODE never needs a re-apply.
+# A Route 53 Resolver endpoint requires two subnets in different availability
+# zones, so the second one exists for `forwarder` mode. Created in both modes so
+# switching LAB_C3_MODE never needs a re-apply.
 resource "aws_subnet" "workload_b" {
   vpc_id            = aws_vpc.lab.id
   cidr_block        = var.workload_subnet_b_cidr
@@ -75,67 +80,60 @@ resource "aws_subnet" "workload_b" {
   tags = { Name = "${local.vpc_name}-workload-b" }
 }
 
-resource "aws_route_table" "private" {
+resource "aws_route_table" "workload" {
   vpc_id = aws_vpc.lab.id
-  tags   = { Name = "${local.vpc_name}-private" }
+  tags   = { Name = "${local.vpc_name}-workload" }
 }
 
 resource "aws_route_table_association" "workload_a" {
   subnet_id      = aws_subnet.workload_a.id
-  route_table_id = aws_route_table.private.id
+  route_table_id = aws_route_table.workload.id
 }
 
 resource "aws_route_table_association" "workload_b" {
   subnet_id      = aws_subnet.workload_b.id
-  route_table_id = aws_route_table.private.id
+  route_table_id = aws_route_table.workload.id
 }
 
 # --------------------------------------------------------------------------- #
-# The test VM
+# The test VM, and how we reach it
 #
-# No public IP, no internet gateway, no SSH. It reaches SSM — and therefore the
-# check reaches it — through interface endpoints. That keeps the VPC realistic
-# (a private workload subnet is what a customer actually has) and removes the
-# security-group hole a bastion would need.
+# WHY THERE IS AN INTERNET GATEWAY HERE
+#
+# This started as a private subnet with no internet and three SSM interface
+# endpoints, because that is what a real workload subnet looks like. It cost
+# three separate debugging cycles and never worked:
+#
+#   1. `dig` could not be installed, because there is no internet.
+#   2. The VM booted before the endpoints existed, so the agent backed off.
+#   3. With the ordering fixed, the agent still registered over the `ssm`
+#      endpoint while Run Command stayed Pending forever — the `ssmmessages`
+#      control channel never established, for reasons not diagnosable from the
+#      outside.
+#
+# The realism was not worth it. Nothing this lab teaches depends on the test VM
+# being in a private subnet: Part 3 asks whether a workload in this VPC can
+# resolve an internal name through Infoblox, and that question is identical
+# either way. What it does depend on is being able to run one command on that
+# VM, reliably, every time.
+#
+# So: an internet gateway, a public subnet, and SSM over the public endpoints —
+# the configuration SSM works in by default. Three fewer resources, about a
+# minute off the build, and no control-channel mystery.
+#
+# The VM still has NO inbound access. Its security group opens nothing, there is
+# no SSH key, and the only way in is SSM Run Command.
 # --------------------------------------------------------------------------- #
 
-resource "aws_security_group" "endpoints" {
-  name        = "${local.vpc_name}-endpoints"
-  description = "HTTPS from the VPC to the SSM interface endpoints"
-  vpc_id      = aws_vpc.lab.id
-
-  ingress {
-    # No em dashes or fancy punctuation in a security group description: the AWS
-    # API rejects the charset and the failure message does not say why.
-    description = "HTTPS from inside the VPC"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-  }
-
-  egress {
-    description = "All outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = { Name = "${local.vpc_name}-endpoints" }
+resource "aws_internet_gateway" "lab" {
+  vpc_id = aws_vpc.lab.id
+  tags   = { Name = "${local.vpc_name}-igw" }
 }
 
-resource "aws_vpc_endpoint" "ssm" {
-  for_each = toset(["ssm", "ssmmessages", "ec2messages"])
-
-  vpc_id              = aws_vpc.lab.id
-  service_name        = "com.amazonaws.${var.region}.${each.key}"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.workload_a.id, aws_subnet.workload_b.id]
-  security_group_ids  = [aws_security_group.endpoints.id]
-  private_dns_enabled = true
-
-  tags = { Name = "${local.vpc_name}-${each.key}" }
+resource "aws_route" "internet" {
+  route_table_id         = aws_route_table.workload.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.lab.id
 }
 
 resource "aws_security_group" "test_vm" {
@@ -196,24 +194,9 @@ resource "aws_instance" "test_vm" {
     echo "techcorp ai workload test host" > /etc/motd
   EOT
 
-  # BOOT AFTER THE ENDPOINTS EXIST. Not a nicety — this was the bug.
-  #
-  # Terraform creates the instance in ~13s and the SSM interface endpoints in
-  # ~55s, so by default the VM boots forty seconds before there is anything for
-  # its agent to talk to. With no internet gateway there is no fallback: the
-  # agent's first attempts fail and it enters backoff.
-  #
-  # It recovers enough to register — describe_instance_information reports
-  # PingStatus Online — but the ssmmessages control channel, which is what
-  # actually delivers Run Command, does not establish. Commands are accepted
-  # and then sit in Pending forever, which is precisely the symptom:
-  #
-  #     SSM: Online
-  #     exec: status=Pending rc=-1 (both streams empty)
-  #
-  # "Registered" and "can be commanded" are different states, and only the
-  # second one matters here.
-  depends_on = [aws_vpc_endpoint.ssm]
+  # The route to the internet has to exist before the agent starts looking for
+  # SSM, or it backs off and takes minutes to retry.
+  depends_on = [aws_route.internet]
 
   # The instance registers with SSM at boot and its metadata changes as tags
   # are applied. Without this a later apply wants to rebuild it.
@@ -265,7 +248,7 @@ resource "aws_vpn_gateway" "lab" {
 resource "aws_route" "on_prem" {
   count = var.c3_mode == "as-a-service" ? 1 : 0
 
-  route_table_id         = aws_route_table.private.id
+  route_table_id         = aws_route_table.workload.id
   destination_cidr_block = var.on_prem_cidr
   gateway_id             = aws_vpn_gateway.lab[0].id
 }
