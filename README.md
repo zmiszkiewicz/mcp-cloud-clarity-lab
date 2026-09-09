@@ -232,8 +232,19 @@ it in the Portal gets credit for whichever kind the UI offered them.
 **What `nsg` mode costs.** Nothing actually serves the zone, so there is no live
 NXDOMAIN to `dig` for. The fault is a real, Portal-visible configuration error
 and the diagnosis conversation is the same, but the participant is reasoning
-about configuration rather than observing a symptom. `02/assignment.md` says so
-plainly rather than promising a `dig` result that will not come.
+about configuration rather than observing a symptom.
+
+It also surfaces mid-lab whether you plan for it or not: once the zone is
+pointed at the server group, the assistant correctly reports that the group has
+**no host members and no hosts are registered in the tenant**. Left unexplained
+that reads as "the fix did not work". Part 2 Step 5 now makes it the closing
+beat instead — two different faults producing one user complaint, only one of
+which is a zone-configuration problem. That is the same configured-versus-
+happening distinction the part opens with, seen from the other side.
+
+Switch to `host` mode the day the sandbox ships a Universal DDI host and the
+whole thread disappears: the group has members, the zone answers, and `dig`
+returns 10.30.1.40.
 
 Switch to `host` mode the moment the sandbox image ships a registered host —
 that is the higher-fidelity lab and it is one env var away.
