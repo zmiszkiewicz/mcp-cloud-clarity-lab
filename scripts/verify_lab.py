@@ -218,6 +218,17 @@ def check_c3(client, ids):
         service = named[0]
         ok(f"Universal Service {cfg.SERVICE_DEPLOYMENT_NAME} exists "
            f"(built at track start)")
+
+        # Existing and being able to serve DNS are different things. A live
+        # sandbox refused the DNS capability outright — "capability 'DNS' is
+        # not allowed" — and seeding creates the service anyway so there is
+        # something to inspect. Saying so here beats letting the participant
+        # discover it as an unexplained timeout in step 3.
+        caps = service.get("capabilities") or []
+        if not any("dns" in str(c.get("type", "")).lower() for c in caps):
+            info(f"the service has no DNS capability, so it cannot serve "
+                 f"{cfg.ZONE_FQDN}. The tenant refused to attach one at track "
+                 f"start — an account entitlement, not anything you did.")
     except LabTodo as todo:
         info(f"Infoblox-side service check unavailable — {todo}")
     except CspError as exc:

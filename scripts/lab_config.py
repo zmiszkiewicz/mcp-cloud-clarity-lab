@@ -405,7 +405,11 @@ SERVICE_IP = os.environ.get("LAB_SERVICE_IP", "10.40.0.53")
 
 # Instance size for the endpoint. Validated against GET /supportedsizes at seed
 # time, which is also how you find out what else is on offer.
-ENDPOINT_SIZE = os.environ.get("LAB_ENDPOINT_SIZE", "SMALL")
+# A live sandbox reports S/M/L/XL from GET /supportedsizes — not the SMALL /
+# MEDIUM / LARGE this originally assumed. service_deployment.pick_size()
+# validates against that endpoint anyway, so a tenant using the other spelling
+# still works; this is just the value that avoids a needless fallback.
+ENDPOINT_SIZE = os.environ.get("LAB_ENDPOINT_SIZE", "S")
 
 # Where the check reads the DNS service IP from once it exists. Written by
 # 03/check-shell via terraform output, or by the participant's own work.
