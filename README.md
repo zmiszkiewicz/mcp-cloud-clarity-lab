@@ -341,74 +341,68 @@ that would let a broken lab through.
 VPC identifiers. It is fatal if the status says not-ready, but by construction
 that should never fire — it catches a VM that broke *between* boot and Part 3.
 
-## The test VM reaches SSM over the internet, and here is why
+## The checks reach the test VM over SSH, because SSM is denied
 
-It began in a private subnet with three SSM interface endpoints and no internet
-gateway, because that is what a real workload subnet looks like. That decision
-cost three debugging cycles and never once worked:
+Part 3 verifies DNS by running a query **on** the test VM. That needs a way in,
+and Systems Manager is not available in this account.
 
-| Attempt | Symptom | What it turned out to be |
-|---|---|---|
-| 1 | probe timed out | `dig` was never installed — no internet to install it |
-| 2 | `SSM: Online`, `status=Pending` | VM booted 40s before the endpoints existed |
-| 3 | `SSM: Online`, `status=Pending` | still, with the ordering fixed. Undiagnosable from outside |
+### The finding
 
-`PingStatus: Online` proves the agent registered over the `ssm` endpoint. Run
-Command is delivered over a separate `ssmmessages` control channel, and that
-one never established — so commands were accepted and then sat in `Pending`
-forever.
+SSM Run Command needs three IAM service prefixes, and two are denied by an
+**org-level Service Control Policy** on the sandbox Instruqt hands out:
 
-**The realism was not worth it.** Nothing this lab teaches depends on the test
-VM being in a private subnet: Part 3 asks whether a workload in this VPC can
-resolve an internal name through Infoblox, and that question is identical either
-way. What it does depend on is running one command on that VM, reliably, every
-time.
-
-So the VPC now has an internet gateway and the workload subnet assigns public
-IPs. SSM works over its public endpoints, which is the configuration it works in
-by default. Three fewer resources and about a minute off the build.
-
-**The VM still has no inbound access** — its security group opens nothing, there
-is no SSH key, and SSM Run Command is the only way in.
-
-**This is still not fixed.** The public subnet did not resolve it either:
-`PingStatus: Online`, Run Command still `Pending`. Four theories, four
-restarts, four wrong.
-
-What the next run will establish, rather than guess:
-
-- `ssm_instance_info()` now matches the record by **InstanceId** instead of
-  taking row `[0]` of a filtered list. If the filter was ever not applied as
-  expected, the old code reported an unrelated instance's ping status as ours —
-  which would produce precisely this symptom.
-- `run_on_test_vm()` polls for **longer than SSM's own `TimeoutSeconds`**, so
-  SSM gets to say `DeliveryTimedOut` ("the agent never collected it") instead
-  of us giving up first and reporting an ambiguous `Pending`.
-- `diagnose_test_vm()` prints the facts on failure: instance state, AMI, public
-  IP, instance profile, SSM ping/agent/platform, and every managed instance in
-  the account.
-
-### Unblocking while it is diagnosed
-
-**`REQUIRE_TEST_VM_DEFAULT` in `scripts/warm_vpc.py` is currently `"0"`**, so
-the track starts and Parts 1, 2 and 4 work normally; Part 3 fails at its own
-check instead of at boot. Put it back to `"1"` once the test VM is reliable.
-
-An Instruqt secret overrides the file if you prefer:
-
-```bash
-instruqt secrets create --name LAB_REQUIRE_TEST_VM --value 0
+```
+AccessDeniedException: not authorized to perform: ec2messages:GetMessages
+  with an explicit deny in a service control policy:
+  arn:aws:organizations::259701776718:policy/o-8k4fgv3uf8/service_control_policy/p-h9dprltz
 ```
 
-> Editing the file works, but **not** by writing `LAB_REQUIRE_TEST_VM=0` above
-> the `os.environ.get()` call — that binds a Python variable and leaves the
-> environment untouched, so the default still wins. It looks like configuration
-> and does nothing. `scripts/check_env_shadowing.py` now fails preflight on
-> exactly that pattern, while leaving the correct
-> `X = os.environ.get("X", ...)` idiom alone.
+No IAM policy can override an SCP explicit deny, and `instruqt track push`
+refuses the prefixes for the same underlying reason
+(`Service ssmmessages is not available in your team`).
 
-`LAB_C3_MODE=forwarder` is the other lever — it drops the VPN gateway and takes
-about four minutes off the build, though it does not touch this problem.
+### Why it took four attempts to find
+
+`ssm` alone **is** permitted. So the heartbeat succeeds, the instance reports
+`PingStatus: Online`, and every Run Command is accepted and then sits in
+`Pending` forever — because the channel that delivers it is denied. That is
+indistinguishable from a routing fault from outside the VM, and it survived:
+
+| Attempt | Change | Why it could not have worked |
+|---|---|---|
+| 1 | installed `dig` via user_data | no internet in a private subnet |
+| 2 | booted the VM after the SSM endpoints | the endpoints were never the problem |
+| 3 | private subnet → public + internet gateway | the denial is IAM, not network |
+| 4 | added the prefixes to `config.yml` | `instruqt track push` rejects them |
+
+What ended it was an instrument that did not depend on SSM: `user_data` writes
+the agent's own log to `/dev/console`, and `console_diagnostics()` reads it with
+`ec2:GetConsoleOutput`. The denial is named there in full. **That should have
+been built before attempt one** — every earlier round was a theory tested by
+restarting the track, which costs ten minutes and proves one thing.
+
+### What replaced it
+
+Terraform generates an ED25519 keypair (`tls_private_key`), registers the public
+half as an `aws_key_pair`, and writes the private half to `/opt/lab/test_vm_key`
+at mode `0600`. `cloud_vpc.run_on_test_vm()` shells out to `ssh`.
+
+Details that matter:
+
+- **`private_key_openssh`, not `private_key_pem`.** OpenSSH will not read a
+  PEM-encoded ED25519 key, and `ssh -i` fails with "invalid format" — which
+  reads as a permissions problem and is not.
+- **The key is not a Terraform output.** Every output is flattened into
+  `scripts/vpc_outputs.json`, which sits in the participant's working directory.
+  Only the *path* travels through outputs.
+- **`ssh_ingress_cidr` is narrowed** by `track_scripts/setup-shell` to the lab
+  container's own egress address, discovered with `checkip.amazonaws.com`. It
+  falls back to `0.0.0.0/0` if that lookup fails, deliberately: the VM is an
+  ephemeral single-participant sandbox host accepting key-only auth, and a
+  security group that excludes the one host allowed to talk to it is a track
+  that cannot start.
+- **`openssh-client` is load-bearing** in the container's apt list, not a
+  convenience.
 
 ## The DNS probe is pure Python, not `dig`
 

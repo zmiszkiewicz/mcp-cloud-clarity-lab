@@ -57,6 +57,42 @@ variable "test_vm_instance_type" {
   default     = "t3.micro"
 }
 
+variable "ssh_ingress_cidr" {
+  description = <<-EOT
+    Who may reach port 22 on the test VM.
+
+    track_scripts/setup-shell sets this to the lab container's own egress
+    address as a /32, discovered with `curl https://checkip.amazonaws.com`.
+
+    THE DEFAULT IS DELIBERATELY WIDE. If that lookup fails — no egress, DNS not
+    up yet, the service down — setup-shell falls back to this rather than
+    guessing an address, because the failure modes are not symmetrical: a wide
+    security group on an ephemeral single-participant sandbox VM that accepts
+    key-only authentication is a small thing, and a security group that excludes
+    the one host allowed to talk to it is a track that cannot start. Narrow it
+    to a fixed egress range if the estate ever has one.
+  EOT
+  type        = string
+  default     = "0.0.0.0/0"
+
+  validation {
+    condition     = can(cidrhost(var.ssh_ingress_cidr, 0))
+    error_message = "ssh_ingress_cidr must be a CIDR block, e.g. 203.0.113.4/32."
+  }
+}
+
+variable "ssh_key_path" {
+  description = <<-EOT
+    Where the generated private key is written in the lab container.
+
+    Outside the repo on purpose. scripts/ is the participant's working directory
+    and the whole of vpc_outputs.json is readable there; /opt/lab is not
+    somewhere they are led. See the keypair note in main.tf.
+  EOT
+  type        = string
+  default     = "/opt/lab/test_vm_key"
+}
+
 variable "c3_mode" {
   description = <<-EOT
     Which Part 3 delivery path to pre-stage.

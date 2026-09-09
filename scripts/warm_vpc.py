@@ -5,9 +5,10 @@ Get the Part 3 VPC all the way to usable, at track boot, in the background.
 WHY THIS RUNS AT BOOT AND NOT IN PART 3
 ---------------------------------------
 Terraform already ran at boot. But creating the test VM is not the same as
-being able to run a command on it: the SSM agent registers a minute or two
-after the instance boots, and until it does, every probe against the VM sits
-Pending until something times out.
+being able to run a command on it: `terraform apply` returns as soon as the
+instance is `running`, which is before sshd is accepting connections and before
+cloud-init has installed the key pair's public half. Until both are true, every
+probe against the VM fails to connect.
 
 That waiting used to happen in `03/setup-shell`, where the participant is sat
 watching a challenge load. It is the same wall-clock time either way — the
@@ -30,9 +31,9 @@ WHAT FAILS THE TRACK, AND WHAT DOES NOT
 ---------------------------------------
 Three separate questions, and only two of them are fatal:
 
-  1. Is the VM manageable through SSM?        FATAL — nothing can run on it.
+  1. Can we open an SSH session to the VM?    FATAL — nothing can run on it.
   2. Can we run a command, and is python3     FATAL — Part 3's check is a
-     there?                                     Python DNS client run over SSM.
+     there?                                     Python DNS client run over SSH.
   3. Does a public name resolve from it?      WARNING ONLY.
 
 (3) used to be fatal and should not have been. It is not the path Part 3
@@ -57,9 +58,15 @@ import cloud_vpc  # noqa: E402
 
 STATUS_FILE = os.environ.get("LAB_VPC_STATUS", "/opt/lab/vpc_status.json")
 
-# The track start blocks on this, so it cannot be open-ended. An SSM agent that
-# is going to register does so in a minute or two; five is generous.
-SSM_WAIT_SECONDS = int(os.environ.get("LAB_SSM_WAIT", "300"))
+# The track start blocks on this, so it cannot be open-ended. A VM that is going
+# to accept SSH does so within a minute or two of `running`; five is generous.
+#
+# Both names are read. LAB_SSM_WAIT is what the tracks in this estate already
+# set, and renaming it in the code would silently ignore an override someone had
+# deliberately configured — the worst kind of rename.
+SSM_WAIT_SECONDS = int(
+    os.environ.get("LAB_VM_WAIT", os.environ.get("LAB_SSM_WAIT", "300"))
+)
 
 # Whether an unusable test VM stops the track starting.
 #
@@ -72,8 +79,15 @@ SSM_WAIT_SECONDS = int(os.environ.get("LAB_SSM_WAIT", "300"))
 #   "0"  it becomes a warning; the track starts and Parts 1, 2 and 4 work,
 #        and Part 3 fails at its own check instead of at boot
 #
-# Currently "0" while the SSM Run Command problem is being diagnosed. Put it
-# back to "1" once the test VM is reliable.
+# Currently "0". It was set that way while the SSM Run Command problem was being
+# diagnosed; that problem is now gone with SSM itself, but the SSH path replacing
+# it has not yet had a green run against real AWS, and a first run of an untested
+# exec path is exactly when you want the track to start anyway so you can read
+# the diagnosis.
+#
+# PUT IT BACK TO "1" AFTER THE FIRST CLEAN RUN. Leaving it at "0" permanently
+# means a broken test VM produces a track that starts, runs for half an hour,
+# and fails at Part 3 — which is the outcome this whole gate exists to prevent.
 #
 # NOTE FOR ANYONE EDITING THIS: writing `LAB_REQUIRE_TEST_VM=0` above the
 # os.environ.get() line does nothing. That creates a Python variable; it does
@@ -108,10 +122,11 @@ def main():
                      detail="terraform did not produce a test VM instance id")
         return 1
 
-    # -- 1. Manageable at all? ---------------------------------------------
-    print(f"waiting for SSM to adopt {instance} "
+    # -- 1. Reachable at all? ----------------------------------------------
+    print(f"waiting for SSH to {instance} "
           f"(up to {SSM_WAIT_SECONDS}s)...", flush=True)
-    online, status = cloud_vpc.ssm_registered(instance, wait=SSM_WAIT_SECONDS)
+    online, status = cloud_vpc.test_vm_reachable(instance,
+                                                 wait=SSM_WAIT_SECONDS)
     if not online:
         # Print the facts before the verdict. A VM that never registers is the
         # case where SSM-based probing tells us nothing at all, so this is
@@ -127,19 +142,18 @@ def main():
         write_status(
             ready=False, ssm=status, exec="skipped", probe="skipped",
             fatal=True,
-            detail=("The test VM never became manageable through SSM. Part 3's "
+            detail=("The test VM never became reachable over SSH. Part 3's "
                     "verification runs commands on it, so the challenge cannot "
-                    "work. Check, in this order: that `ssm`, `ssmmessages` AND "
-                    "`ec2messages` are all in the AWS services list in "
-                    "config.yml (all three are required and only the first "
-                    "affects PingStatus); that the instance profile's policy "
-                    "attachment exists; and that the workload subnet is "
-                    "associated with the route table carrying the default "
-                    "route. The console diagnostics above name the failing "
-                    "call directly."),
+                    "work. Check, in this order: that the security group's "
+                    "port 22 rule covers this container's egress address (the "
+                    "diagnosis above prints both, and they must agree); that "
+                    "the private key exists where Terraform wrote it; that the "
+                    "workload subnet is associated with the route table "
+                    "carrying the default route; and that cloud-init finished "
+                    "and sshd is up, which the console block reports."),
         )
         return 1
-    print(f"   SSM: {status}", flush=True)
+    print(f"   reachable: {status}", flush=True)
 
     # -- 2. Can we actually execute, and is python3 present? ----------------
     can_run, exec_detail = cloud_vpc.test_vm_can_run_commands(instance)

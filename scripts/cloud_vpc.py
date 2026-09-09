@@ -9,22 +9,24 @@ worth a challenge. So the load-bearing assertion runs `dig` ON THE TEST VM,
 inside the VPC, through whatever DNS path the participant just built — and this
 module is how the check reaches in to do that.
 
-Reaching in is done with SSM Run Command rather than SSH. No key material to
-distribute, no security-group hole to punch for port 22, and the test VM needs
-an SSM agent and an instance profile anyway to be a realistic workload.
+Reaching in is done over SSH, with a keypair Terraform generates per track run
+and writes to the path in the `test_vm_ssh_key_path` output. `run_on_test_vm()`
+is the one function here that touches the wire; everything else is built on it.
 
-SSM NEEDS THREE IAM SERVICE PREFIXES, and config.yml must list all of them:
-`ssm` (the heartbeat, which is what sets PingStatus to Online), `ssmmessages`
-(the control channel Run Command is delivered over) and `ec2messages`. With only
-`ssm` allowed, every probe in this module reports a VM that is Online and will
-not run anything — which reads as a network fault and is not one. That cost
-three rounds of debugging aimed at the subnet; see the note above
-`aws_internet_gateway` in terraform/main.tf.
+WHY NOT SSM RUN COMMAND, WHICH IS THE BETTER TOOL FOR THIS. Systems Manager
+needs three IAM service prefixes — `ssm` for the heartbeat, `ssmmessages` for
+the channel Run Command is delivered over, `ec2messages` for agent startup — and
+this Instruqt team's accounts can only be granted `ssm`. One of three produces a
+VM that registers, reports PingStatus "Online", and then never executes
+anything: a symptom that reads as a network fault and is not one. See "HOW THE
+CHECKS REACH THE TEST VM" in terraform/main.tf. If the other two prefixes are
+ever enabled, moving back is a change to this file alone — the instance profile
+is still attached to the VM.
 
-The VM reaches SSM over the PUBLIC endpoints, via an internet gateway, and its
-console carries a diagnostic block (`LAB_SSM_DIAG`) written by user_data.
-`diagnose_test_vm()` reads it. That path deliberately does not depend on SSM,
-because the situations worth diagnosing are the ones where SSM is what broke.
+The VM's console carries a diagnostic block (`LAB_VM_DIAG`) written by user_data
+and read by `diagnose_test_vm()` over `ec2:GetConsoleOutput`. That path shares
+nothing with the exec path above it, deliberately: the situation worth
+diagnosing is the one where the exec path is what broke.
 
 Nothing here creates infrastructure. Terraform does that at track setup; this
 module only observes.
@@ -32,6 +34,8 @@ module only observes.
 
 import json
 import os
+import socket
+import subprocess
 import time
 
 import lab_config as cfg
@@ -113,16 +117,15 @@ def test_vm_instance_id():
 
 # A DNS client in pure Python, run on the test VM.
 #
-# NOT `dig`. The test VM sits in a private subnet with no internet gateway and
-# no NAT — deliberately, because that is what a real workload subnet looks like
-# — so `dnf install bind-utils` in user_data could never have worked, and
-# Amazon Linux 2023 does not ship bind-utils. The probe was calling a binary
-# that was not there.
+# NOT `dig`. Amazon Linux 2023 does not ship bind-utils, and nothing is
+# installed on the VM at boot — a boot that depends on a package mirror is a
+# boot that can fail for reasons this lab does not care about. An earlier
+# version called `dig` anyway and was calling a binary that was not there.
 #
-# Rather than add a NAT gateway to install one package, ask the interpreter
-# that IS there. This does a UDP query with the standard library only, and
-# unlike `getent hosts` it can be pointed at a specific resolver — which Part 3
-# needs, since the whole question is whether a particular DNS service answers.
+# So ask the interpreter that IS there. This does a UDP query with the standard
+# library only, and unlike `getent hosts` it can be pointed at a specific
+# resolver — which Part 3 needs, since the whole question is whether a
+# particular DNS service answers.
 _DNS_PROBE = r'''
 import socket, struct, sys, random
 
@@ -190,75 +193,160 @@ for a in answers:
 '''
 
 
-def ssm_instance_info(instance_id):
+# --------------------------------------------------------------------------- #
+# How we reach the VM: SSH
+# --------------------------------------------------------------------------- #
+
+SSH_USER = "ec2-user"           # Amazon Linux 2023's default login
+SSH_KEY_FALLBACK = "/opt/lab/test_vm_key"
+
+# StrictHostKeyChecking=no and a null known_hosts file, because the VM is built
+# fresh every track run and its host key has therefore never been seen before.
+# The alternative is a prompt that a check script would hang on forever.
+#
+# BatchMode=yes turns every would-be prompt into an immediate failure, which is
+# what a non-interactive caller wants: a check that fails in 5s beats one that
+# blocks until Instruqt kills the challenge.
+SSH_BASE_OPTS = [
+    "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",             # suppresses the known-hosts warning
+    "-o", "ConnectTimeout=10",
+]
+
+
+def ssh_key_path():
+    """Where Terraform wrote the private key."""
+    return outputs().get("test_vm_ssh_key_path") or SSH_KEY_FALLBACK
+
+
+def test_vm_public_ip():
     """
-    The SSM registration record for THIS instance, or None.
-
-    Matches on InstanceId explicitly rather than trusting the filter and taking
-    row [0]. The old version did the latter, which is only correct if the
-    filter is applied as expected — and if it ever is not, it reports the ping
-    status of some unrelated instance in the account as though it were ours.
-    That would produce exactly the symptom we have been chasing: a confident
-    "Online" for a VM whose agent has never checked in.
+    The address the checks SSH to — from Terraform output, falling back to a
+    live describe so a VM that was replaced is still reachable.
     """
-    ssm = _client("ssm")
-    rows = ssm.describe_instance_information(Filters=[
-        {"Key": "InstanceIds", "Values": [instance_id]},
-    ])["InstanceInformationList"]
+    recorded = outputs().get("test_vm_public_ip")
+    if recorded:
+        return recorded
 
-    for row in rows:
-        if row.get("InstanceId") == instance_id:
-            return row
-
-    # Nothing matched. Say what the filter DID return, because "the filter is
-    # not doing what I think" is a real possibility worth ruling out.
-    if rows:
-        others = ", ".join(r.get("InstanceId", "?") for r in rows[:5])
-        raise LookupError(
-            f"the SSM filter returned {len(rows)} record(s) but none for "
-            f"{instance_id} — got: {others}"
-        )
-    return None
+    instance_id = test_vm_instance_id()
+    if not instance_id:
+        return None
+    try:
+        reservations = _client("ec2").describe_instances(
+            InstanceIds=[instance_id])["Reservations"]
+        return reservations[0]["Instances"][0].get("PublicIpAddress")
+    except Exception:                                   # noqa: BLE001
+        return None
 
 
-def ssm_registered(instance_id, wait=0):
+def test_vm_reachable(instance_id=None, wait=0):
     """
-    Is THIS VM managed by SSM, and currently Online? Optionally wait for it.
+    Can we open an SSH session to the VM? Optionally wait for it.
 
-    Returns (bool, detail) where detail carries the agent version and last ping
-    when known, because "Online" alone has repeatedly turned out to be true and
-    unhelpful.
+    Returns (bool, detail). Replaces the old `ssm_registered()`, and the
+    difference is worth stating: that function asked AWS whether the agent had
+    checked in, which turned out to be a different question from whether we
+    could run anything — a VM could report "Online" and be entirely unusable.
+    This asks the question we actually care about by attempting the thing we
+    actually want to do, so a pass here cannot be a false positive.
+
+    Two stages, because they fail for different reasons and the distinction is
+    the first thing anyone debugging this needs:
+
+      * TCP 22 refused/timed out — the security group, the route, or sshd not
+        up yet. Nothing to do with keys.
+      * TCP open but authentication rejected — the key pair, or cloud-init not
+        having installed authorized_keys yet.
     """
+    instance_id = instance_id or test_vm_instance_id()
+    address = test_vm_public_ip()
+    if not address:
+        return False, ("the test VM has no public IP — check that "
+                       "map_public_ip_on_launch is set on the workload subnet")
+
+    key = ssh_key_path()
+    if not os.path.exists(key):
+        return False, (f"the SSH key {key} does not exist. Terraform writes it "
+                       f"at apply; if the apply succeeded, check "
+                       f"local_sensitive_file.test_vm_key in terraform/main.tf")
+
     deadline = time.time() + max(wait, 0)
+    status = "no attempt made"
     while True:
+        # Stage 1: is anything listening?
         try:
-            row = ssm_instance_info(instance_id)
-            if row is None:
-                status = "not registered with SSM at all"
-            else:
-                ping = row.get("PingStatus")
-                last = row.get("LastPingDateTime")
-                agent = row.get("AgentVersion", "?")
-                status = (f"{ping} (agent {agent}, "
-                          f"last ping {last:%H:%M:%S}" if last else
-                          f"{ping} (agent {agent}")
-                status += ")"
-                if ping == "Online":
-                    return True, status
-        except Exception as exc:                        # noqa: BLE001
-            status = f"lookup failed: {exc}"
+            with socket.create_connection((address, 22), timeout=5):
+                pass
+            port_open = True
+            status = f"port 22 open on {address}, but no session yet"
+        except OSError as exc:
+            port_open = False
+            status = f"port 22 on {address} not reachable: {exc}"
+
+        # Stage 2: does a session actually establish?
+        if port_open:
+            probe = _ssh(["true"], timeout=20)
+            if probe.returncode == 0:
+                return True, f"SSH to {SSH_USER}@{address} established"
+            stderr = (probe.stderr or "").strip().splitlines()
+            status = (f"port 22 open on {address} but SSH failed: "
+                      f"{stderr[-1] if stderr else 'no error output'}")
+
         if time.time() >= deadline:
             return False, status
         time.sleep(5)
+
+
+def _ssh(remote_argv, timeout=60, stdin_data=None):
+    """
+    One SSH invocation. Returns the CompletedProcess unexamined.
+
+    Split out so run_on_test_vm() and test_vm_reachable() cannot drift in how
+    they connect — the retry logic differs between them, the connection details
+    must not.
+    """
+    address = test_vm_public_ip()
+    argv = (["ssh", "-i", ssh_key_path()] + SSH_BASE_OPTS
+            + [f"{SSH_USER}@{address}"] + list(remote_argv))
+    return subprocess.run(
+        argv,
+        input=stdin_data,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def container_egress_ip():
+    """
+    This container's public address, as AWS sees it. None if it cannot be found.
+
+    The same lookup track_scripts/setup-shell does to set TF_VAR_ssh_ingress_cidr.
+    Repeated here rather than read back from Terraform on purpose: the point is
+    to catch the case where the two DISAGREE, which is what happens if the
+    container's egress address changes part-way through a track.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen("https://checkip.amazonaws.com",
+                                    timeout=10) as response:
+            return response.read().decode().strip()
+    except Exception:                                   # noqa: BLE001
+        return None
 
 
 def diagnose_test_vm(instance_id=None):
     """
     Everything knowable about the VM from outside it, in one block.
 
-    Exists because four separate theories about why Run Command sits in
-    Pending have each been wrong, and each cost a track restart to disprove.
-    Printing the facts once is cheaper than another round of hypotheses.
+    Exists because four separate theories about why Run Command sat in Pending
+    were each wrong, and each cost a track restart to disprove. The exec path is
+    SSH now, but the trap is the same shape — a VM you cannot reach is a VM you
+    cannot ask why — so this stays, and everything in it is read from the AWS
+    API or the serial console rather than from the VM itself.
     """
     instance_id = instance_id or test_vm_instance_id()
     lines = [f"instance: {instance_id}"]
@@ -274,37 +362,51 @@ def diagnose_test_vm(instance_id=None):
             f"  ami:            {inst.get('ImageId')}",
             f"  public ip:      {inst.get('PublicIpAddress', 'NONE')}",
             f"  subnet:         {inst.get('SubnetId')}",
+            f"  key pair:       {inst.get('KeyName', 'NONE')}",
             f"  instance profile: {profile.rsplit('/', 1)[-1]}",
             f"  launched:       {inst.get('LaunchTime')}",
         ]
     except Exception as exc:                            # noqa: BLE001
         lines.append(f"  EC2 lookup failed: {exc}")
 
-    try:
-        row = ssm_instance_info(instance_id)
-        if row is None:
-            lines.append("  SSM: NOT REGISTERED — the agent has never checked in")
-        else:
-            lines += [
-                f"  SSM ping:       {row.get('PingStatus')}",
-                f"  SSM last ping:  {row.get('LastPingDateTime')}",
-                f"  SSM agent:      {row.get('AgentVersion')} "
-                f"(latest={row.get('IsLatestVersion')})",
-                f"  SSM platform:   {row.get('PlatformName')} "
-                f"{row.get('PlatformVersion')}",
-            ]
-    except Exception as exc:                            # noqa: BLE001
-        lines.append(f"  SSM lookup failed: {exc}")
+    # The SSH path, from this side. Both halves of it, because "the key is
+    # missing" and "the security group does not let me in" are different faults
+    # with the same symptom.
+    key = ssh_key_path()
+    lines.append(f"  ssh key:        {key} "
+                 f"({'present' if os.path.exists(key) else 'MISSING'})")
 
-    # Every managed instance in the account, to show whether the filter above
-    # is telling the truth.
+    address = test_vm_public_ip()
+    if address:
+        try:
+            with socket.create_connection((address, 22), timeout=5):
+                lines.append(f"  tcp 22:         open on {address}")
+        except OSError as exc:
+            lines.append(f"  tcp 22:         UNREACHABLE on {address} — {exc}")
+            lines.append("                  (security group ssh_ingress_cidr, "
+                         "or the route to the internet gateway)")
+
+    # What the security group actually permits inbound, since the most likely
+    # cause of an unreachable port 22 is that this container's egress address is
+    # not the one Terraform was told about.
     try:
-        ssm = _client("ssm")
-        allrows = ssm.describe_instance_information()["InstanceInformationList"]
-        lines.append(f"  managed instances in this account: "
-                     f"{[r.get('InstanceId') for r in allrows][:8]}")
+        groups = _client("ec2").describe_security_groups(Filters=[
+            {"Name": "group-name", "Values": [f"*{cfg.VPC_NAME}*test-vm*"]},
+        ])["SecurityGroups"]
+        for group in groups[:2]:
+            for rule in group.get("IpPermissions", []):
+                if rule.get("FromPort") == 22:
+                    allowed = [r.get("CidrIp") for r in rule.get("IpRanges", [])]
+                    lines.append(f"  sg 22 allows:   {allowed}")
     except Exception as exc:                            # noqa: BLE001
-        lines.append(f"  account-wide SSM listing failed: {exc}")
+        lines.append(f"  security group lookup failed: {exc}")
+
+    # The line above and the line below are meant to be read together. If this
+    # container's egress address is not inside what the security group allows,
+    # that is the whole fault — and it is the one failure mode this design has
+    # that SSM did not, because setup-shell pins the rule to an address
+    # discovered once at track start.
+    lines.append(f"  this container:  {container_egress_ip() or 'unknown'}")
 
     # The agent's own account of itself, read WITHOUT using SSM.
     lines.append("")
@@ -315,7 +417,7 @@ def diagnose_test_vm(instance_id=None):
 
 def console_diagnostics(instance_id=None):
     """
-    The `LAB_SSM_DIAG` blocks the VM writes to its serial console at boot.
+    The `LAB_VM_DIAG` blocks the VM writes to its serial console at boot.
 
     This is the only instrument here that does not depend on the thing it is
     used to diagnose. Every other probe in this module asks SSM whether SSM is
@@ -347,16 +449,16 @@ def console_diagnostics(instance_id=None):
 
     # Keep only the newest diagnostic block. The console buffer also holds the
     # whole kernel boot, which is a lot of text and none of it relevant.
-    blocks = output.split("=== LAB_SSM_DIAG start")
+    blocks = output.split("=== LAB_VM_DIAG start")
     if len(blocks) < 2:
-        return ("console: readable, but no LAB_SSM_DIAG block yet — the first "
+        return ("console: readable, but no LAB_VM_DIAG block yet — the first "
                 "is written about 60s after boot. If the VM has been up for "
                 "several minutes and there is still none, user_data did not "
                 "run; check the tail of the console for a cloud-init error.")
 
-    newest = blocks[-1].split("=== LAB_SSM_DIAG end")[0]
+    newest = blocks[-1].split("=== LAB_VM_DIAG end")[0]
     body = "\n".join(f"    {line}" for line in newest.strip().splitlines())
-    return f"  console (newest LAB_SSM_DIAG block):\n{body}"
+    return f"  console (newest LAB_VM_DIAG block):\n{body}"
 
 
 def run_on_test_vm(command, timeout=180, instance_id=None):
@@ -370,77 +472,69 @@ def run_on_test_vm(command, timeout=180, instance_id=None):
     actually happened. An earlier version returned only "no output from the
     probe", which was true and useless: it did not say whether the command
     failed, timed out, or ran fine and printed nothing.
+
+    `instance_id` is accepted and ignored. Addressing is by public IP now that
+    this goes over SSH rather than SSM; the parameter stays so callers that pass
+    it — and the shape of the SSM version, if it ever comes back — are unchanged.
     """
-    instance_id = instance_id or test_vm_instance_id()
-    if not instance_id:
-        return {"ok": False, "status": "no-instance", "rc": None,
+    address = test_vm_public_ip()
+    if not address:
+        return {"ok": False, "status": "no-address", "rc": None,
                 "stdout": "", "stderr": "",
-                "detail": "no test VM instance id available"}
+                "detail": "the test VM has no public IP to connect to"}
 
-    ssm = _client("ssm")
+    key = ssh_key_path()
+    if not os.path.exists(key):
+        return {"ok": False, "status": "no-key", "rc": None,
+                "stdout": "", "stderr": "",
+                "detail": f"the SSH key {key} does not exist — Terraform "
+                          f"writes it at apply time"}
+
+    # The command goes over STDIN rather than as an argv element, so it needs no
+    # shell quoting on this side and can contain anything. `bash -s` reads the
+    # script from stdin; the remote shell never sees it as a word to split.
     try:
-        sent = ssm.send_command(
-            InstanceIds=[instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [command]},
-            # SSM marks a command DeliveryTimedOut once this elapses without
-            # the agent collecting it. We poll for LONGER than this on purpose:
-            # racing it produced an ambiguous "Pending" where SSM would have
-            # told us plainly that the agent never picked the command up.
-            TimeoutSeconds=120,
-        )
-    except Exception as exc:                            # noqa: BLE001
-        return {"ok": False, "status": "send-failed", "rc": None,
+        proc = _ssh(["bash", "-s"], timeout=timeout, stdin_data=command)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "status": "timeout", "rc": None,
                 "stdout": "", "stderr": "",
-                "detail": f"SSM send_command failed: {exc}"}
-
-    command_id = sent["Command"]["CommandId"]
-    deadline = time.time() + timeout
-    invocation = None
-
-    while time.time() < deadline:
-        time.sleep(3)
-        try:
-            invocation = ssm.get_command_invocation(
-                CommandId=command_id, InstanceId=instance_id
-            )
-        except ssm.exceptions.InvocationDoesNotExist:
-            continue
-        if invocation["Status"] not in ("Pending", "InProgress", "Delayed"):
-            break
-
-    if not invocation:
-        return {"ok": False, "status": "no-invocation", "rc": None,
+                "detail": f"the command did not finish within {timeout}s"}
+    except FileNotFoundError:
+        return {"ok": False, "status": "no-ssh-client", "rc": None,
                 "stdout": "", "stderr": "",
-                "detail": f"no SSM invocation appeared within {timeout}s"}
+                "detail": ("the `ssh` binary is not installed in this "
+                           "container. track_scripts/setup-shell installs "
+                           "openssh-client; if you are running by hand, "
+                           "`apt install -y openssh-client`")}
 
-    status = invocation.get("Status")
-    rc = invocation.get("ResponseCode")
-    stdout = (invocation.get("StandardOutputContent") or "").strip()
-    stderr = (invocation.get("StandardErrorContent") or "").strip()
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    rc = proc.returncode
 
+    # SSH's own failures and the remote command's failures both arrive as a
+    # non-zero rc, and they need completely different remedies. 255 is ssh(1)'s
+    # reserved code for "I could not establish the session at all".
+    if rc == 255:
+        first = stderr.splitlines()[0] if stderr else "no error output"
+        return {"ok": False, "status": "ssh-failed", "rc": rc,
+                "stdout": stdout, "stderr": stderr,
+                "detail": (f"could not open an SSH session to {SSH_USER}@"
+                           f"{address}: {first}. This is a CONNECTION fault, "
+                           f"not a command fault — check the security group's "
+                           f"port 22 rule (ssh_ingress_cidr must contain this "
+                           f"container's egress address), that the VM is "
+                           f"running, and that cloud-init has installed "
+                           f"authorized_keys. diagnose_test_vm() reads sshd's "
+                           f"state from the console without needing SSH.")}
+
+    status = "Success" if rc == 0 else "Failed"
     detail = f"status={status} rc={rc}"
     if stderr:
         detail += f" stderr={stderr[:300]}"
     if not stdout and not stderr:
         detail += " (both streams empty)"
 
-    # Pending at the deadline means the agent never picked the command up, which
-    # is a different fault from one that ran and failed. Say so, because the
-    # remedy is different too.
-    if status == "Pending":
-        detail += (" — the SSM agent accepted the command but never ran it. "
-                   "'Registered' and 'commandable' are different states: the "
-                   "heartbeat is ssm:UpdateInstanceInformation, the delivery "
-                   "path is ssmmessages:*, and they can be permitted "
-                   "separately. THE FIRST THING TO CHECK is that `ssmmessages` "
-                   "and `ec2messages` are both in the services list in "
-                   "config.yml — with only `ssm` there, this is exactly the "
-                   "symptom. Then check the public IP and the route to the "
-                   "internet gateway. `diagnose_test_vm()` prints the agent's "
-                   "own log from the console, which names the denied call")
-
-    return {"ok": status == "Success" and rc == 0,
+    return {"ok": rc == 0,
             "status": status, "rc": rc,
             "stdout": stdout, "stderr": stderr, "detail": detail}
 
@@ -450,21 +544,14 @@ def test_vm_can_run_commands(instance_id=None, attempts=2, timeout=150):
     Can we execute anything at all on the VM, and is python3 there?
 
     Separate from the DNS question on purpose. These two are what Part 3
-    genuinely requires — its check runs a Python DNS client over SSM — whereas
+    genuinely requires — its check runs a Python DNS client over SSH — whereas
     whether a *public* name resolves at boot is a convenience, and not even the
     path Part 3 exercises. Conflating them meant a public-DNS quirk failed the
     whole track start.
 
-    RETRIED, because the failure it guards against is a timing one. The agent's
-    control channel takes a little while to establish after boot, and a single
-    attempt turns "not ready yet" into "will never work". Terraform now boots
-    the VM only after its route, its subnet association and its IAM policy all
-    exist, which should make the first attempt succeed; these retries are what
-    stops a merely slow agent failing a whole track start anyway.
-
-    Note that no number of retries fixes a missing `ssmmessages` permission —
-    that failure is permanent and looks identical from here. run_on_test_vm()
-    says so in its Pending detail, and diagnose_test_vm() can prove it.
+    RETRIED, because the failure it guards against is a timing one: cloud-init
+    installs authorized_keys a moment after sshd starts accepting connections,
+    so a single early attempt turns "not ready yet" into "will never work".
     """
     last = "no attempt made"
     for attempt in range(1, attempts + 1):
@@ -486,9 +573,10 @@ def test_vm_can_run_commands(instance_id=None, attempts=2, timeout=150):
             return True, f"commands run; python3 {version[0]}"
 
         last = result["detail"]
-        if result["status"] not in ("Pending", "InProgress", "Delayed",
-                                    "no-invocation"):
-            # Ran and genuinely failed. Retrying will not change the answer.
+        # Only a connection fault or a timeout is worth another go. Anything
+        # else means the command reached the VM and genuinely failed, and
+        # retrying will not change the answer.
+        if result["status"] not in ("ssh-failed", "timeout"):
             break
         if attempt < attempts:
             info(f"    attempt {attempt}: {last} — retrying")
@@ -496,7 +584,7 @@ def test_vm_can_run_commands(instance_id=None, attempts=2, timeout=150):
     return False, f"could not run a command on the VM — {last}"
 
 
-def resolve_from_test_vm(fqdn, resolver=None, timeout=120, ssm_wait=0):
+def resolve_from_test_vm(fqdn, resolver=None, timeout=120, boot_wait=0):
     """
     Resolve a name FROM INSIDE the VPC and return the answers.
 
@@ -517,14 +605,15 @@ def resolve_from_test_vm(fqdn, resolver=None, timeout=120, ssm_wait=0):
                     "environment fault, not your mistake — tell your "
                     "facilitator.")
 
-    online, status = ssm_registered(instance_id, wait=ssm_wait)
-    if not online:
-        return [], (f"The test VM ({instance_id}) is not reachable through SSM "
-                    f"— ping status: {status}. Nothing can run on it, so this "
-                    f"is an environment fault rather than a DNS problem. The "
-                    f"usual causes are the `ssmmessages` / `ec2messages` "
-                    f"services missing from config.yml, the instance profile "
-                    f"missing its policy, or no route to the internet gateway.")
+    reachable, status = test_vm_reachable(instance_id, wait=boot_wait)
+    if not reachable:
+        return [], (f"The test VM ({instance_id}) is not reachable over SSH — "
+                    f"{status}. Nothing can run on it, so this is an "
+                    f"environment fault rather than a DNS problem. The usual "
+                    f"causes are the security group's port 22 rule not "
+                    f"covering this container's egress address, the private "
+                    f"key missing from the container, or no route to the "
+                    f"internet gateway.")
 
     payload = base64.b64encode(_DNS_PROBE.encode()).decode()
     command = (f"echo {payload} | base64 -d > /tmp/dnsprobe.py && "

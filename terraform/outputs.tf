@@ -45,6 +45,32 @@ output "test_vm_private_ip" {
   value = aws_instance.test_vm.private_ip
 }
 
+# --------------------------------------------------------------------------- #
+# How the checks reach the VM. See "HOW THE CHECKS REACH THE TEST VM" in
+# main.tf — SSH rather than SSM, because this Instruqt team can be granted the
+# `ssm` service prefix but not `ssmmessages` or `ec2messages`.
+#
+# THE PRIVATE KEY IS NOT AN OUTPUT. Everything here is flattened into
+# scripts/vpc_outputs.json, which sits in the participant's working directory.
+# Terraform writes the key straight to `ssh_key_path` instead; only the path
+# travels through here.
+# --------------------------------------------------------------------------- #
+
+output "test_vm_public_ip" {
+  description = "Where the Part 3 probe SSHes to."
+  value       = aws_instance.test_vm.public_ip
+}
+
+output "test_vm_ssh_user" {
+  description = "Amazon Linux 2023's default login."
+  value       = "ec2-user"
+}
+
+output "test_vm_ssh_key_path" {
+  description = "Private key for the test VM, written by Terraform at apply."
+  value       = local_sensitive_file.test_vm_key.filename
+}
+
 output "vpn_gateway_id" {
   description = "as-a-service mode. Empty in forwarder mode."
   value       = try(aws_vpn_gateway.lab[0].id, "")

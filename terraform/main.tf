@@ -36,10 +36,14 @@ data "aws_availability_zones" "available" {
 }
 
 
-# Amazon Linux 2023, for two properties the probe depends on: the SSM agent is
-# preinstalled (how the check reaches in) and so is python3 (how it queries
-# DNS, since this subnet cannot install packages). Looked up rather than pinned
-# so the lab does not rot when the AMI is rotated.
+# Amazon Linux 2023, for the two properties the probe depends on: sshd is
+# configured and running at boot with the instance's key pair installed (how the
+# check reaches in) and python3 is preinstalled (how it queries DNS, since
+# nothing is installed on this VM at boot). Looked up rather than pinned so the
+# lab does not rot when the AMI is rotated.
+#
+# The `al2023-ami-2023.*` prefix deliberately excludes `al2023-ami-minimal-*`,
+# which ships neither.
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -121,41 +125,46 @@ resource "aws_route_table_association" "workload_b" {
 # --------------------------------------------------------------------------- #
 # The test VM, and how we reach it
 #
-# WHY THERE IS AN INTERNET GATEWAY HERE
+# HOW THE CHECKS REACH THE TEST VM: SSH, NOT SSM
 #
-# This started as a private subnet with no internet and three SSM interface
-# endpoints, because that is what a real workload subnet looks like. It cost
-# three separate debugging cycles and never worked:
+# Part 3's load-bearing assertion runs a DNS query ON this VM, from inside the
+# VPC. That needs exactly one capability — execute a command, read stdout — and
+# this lab gets it over SSH with a keypair Terraform generates per run.
 #
-#   1. `dig` could not be installed, because there is no internet.
-#   2. The VM booted before the endpoints existed, so the agent backed off.
-#   3. With the ordering fixed, the agent still registered over the `ssm`
-#      endpoint while Run Command stayed Pending forever — the `ssmmessages`
-#      control channel never established.
+# IT USED TO USE SSM RUN COMMAND, which is the better tool for the job: no key
+# material, no inbound port. It was abandoned for a reason that has nothing to
+# do with which is better. Systems Manager needs three IAM service prefixes —
+# `ssm` for the heartbeat, `ssmmessages` for the channel Run Command is actually
+# delivered over, and `ec2messages` for agent startup — and this Instruqt team's
+# account can only be granted `ssm`:
 #
-# (3) IS NOW UNDERSTOOD, AND IT WAS NEVER THE NETWORK. `ssmmessages` is a
-# separate IAM service prefix from `ssm`, and config.yml listed only `ssm` in
-# the sandbox account's allowed services. So the heartbeat was permitted and the
-# control channel was denied — which presents exactly as "registers Online,
-# never runs anything", the symptom that sent three rounds of debugging at the
-# subnet. Both prefixes are listed in config.yml now, along with `ec2messages`.
+#     [ERROR] Service ssmmessages is not available in your team
 #
-# The public subnet is kept regardless. The realism was not worth it and the
-# reasoning below still holds — but note that it was a fix for a problem this
-# file did not have, so if the VM ever fails to register again, check the IAM
-# side FIRST.
+# One of three. The instance registers, reports PingStatus "Online", and every
+# Run Command sits in Pending until it times out. That combination reads exactly
+# like a network fault and is not one, which is how it consumed three rounds of
+# debugging aimed at the subnet: first the private subnet and its three
+# interface endpoints, then boot ordering against them, then the move to a
+# public subnet and the public endpoints. None of them could have worked.
 #
-# Nothing this lab teaches depends on the test VM being in a private subnet:
-# Part 3 asks whether a workload in this VPC can resolve an internal name
-# through Infoblox, and that question is identical either way. What it does
-# depend on is being able to run one command on that VM, reliably, every time.
+# SSH needs only the `ec2` prefix, which this team has. That is the entire
+# argument for it. If Instruqt ever enables the other two prefixes, SSM is the
+# better path and worth moving back to — the instance profile below is still
+# attached, so that switch is a change to scripts/cloud_vpc.py alone.
 #
-# So: an internet gateway, a public subnet, and SSM over the public endpoints —
-# the configuration SSM works in by default. Three fewer resources, about a
-# minute off the build, and no control-channel mystery.
+# WHAT THIS COSTS. The VM previously had no inbound access at all. It now opens
+# port 22 to `ssh_ingress_cidr`, which track_scripts/setup-shell narrows to the
+# lab container's egress address. Password authentication is off (Amazon Linux
+# 2023 ships it off and nothing here turns it on), the key is generated per
+# track run and never leaves the container, and the instance is an ephemeral
+# per-participant sandbox holding nothing. Worth stating plainly rather than
+# leaving as a diff nobody reads.
 #
-# The VM still has NO inbound access. Its security group opens nothing, there is
-# no SSH key, and the only way in is SSM Run Command.
+# WHY THERE IS AN INTERNET GATEWAY HERE. Inherited from the SSM era, when the
+# VM needed to reach the public SSM endpoints, and kept because SSH from the
+# container now needs the same thing. Nothing this lab teaches depends on the
+# test VM being private: Part 3 asks whether a workload in this VPC can resolve
+# an internal name through Infoblox, and that question is identical either way.
 # --------------------------------------------------------------------------- #
 
 resource "aws_internet_gateway" "lab" {
@@ -171,8 +180,18 @@ resource "aws_route" "internet" {
 
 resource "aws_security_group" "test_vm" {
   name        = "${local.vpc_name}-test-vm"
-  description = "Test workload. DNS out, HTTPS out for SSM, nothing in."
+  description = "Test workload. DNS and HTTPS out, SSH in from the lab container only."
   vpc_id      = aws_vpc.lab.id
+
+  # The only way in. Key-only — Amazon Linux 2023 ships sshd with
+  # PasswordAuthentication off and nothing in user_data turns it on.
+  ingress {
+    description = "SSH from the lab container, for the Part 3 DNS probe"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.ssh_ingress_cidr]
+  }
 
   egress {
     description = "All outbound"
@@ -183,6 +202,42 @@ resource "aws_security_group" "test_vm" {
   }
 
   tags = { Name = "${local.vpc_name}-test-vm" }
+}
+
+# --------------------------------------------------------------------------- #
+# The SSH keypair the checks use
+#
+# Generated per track run rather than taken from a secret. There is nothing to
+# rotate, nothing to leak between participants, and no Instruqt secret to create
+# before this track can be pushed. The private half is written to the container
+# at `ssh_key_path` and never appears in a Terraform OUTPUT — outputs.tf is
+# flattened wholesale into scripts/vpc_outputs.json, which the participant can
+# read, so a key placed there would be sitting in their working directory.
+#
+# It IS in Terraform state, unavoidably. State lives only in the container, for
+# the lifetime of one track run, alongside the key file itself.
+# --------------------------------------------------------------------------- #
+
+resource "tls_private_key" "test_vm" {
+  algorithm = "ED25519"
+}
+
+resource "aws_key_pair" "test_vm" {
+  key_name   = "${local.vpc_name}-test-vm"
+  public_key = tls_private_key.test_vm.public_key_openssh
+
+  tags = { Name = "${local.vpc_name}-test-vm" }
+}
+
+resource "local_sensitive_file" "test_vm_key" {
+  # `private_key_openssh`, not `private_key_pem`. ED25519 has no PEM
+  # representation that OpenSSH will read, and `ssh -i` on a PEM-encoded ED25519
+  # key fails with "invalid format" — which looks like a permissions problem and
+  # is not.
+  content              = tls_private_key.test_vm.private_key_openssh
+  filename             = var.ssh_key_path
+  file_permission      = "0600" # ssh refuses to use a key that is group-readable
+  directory_permission = "0700"
 }
 
 resource "aws_iam_role" "test_vm" {
@@ -198,6 +253,12 @@ resource "aws_iam_role" "test_vm" {
   })
 }
 
+# NO LONGER LOAD-BEARING, and kept deliberately. The checks reach the VM over
+# SSH now, so nothing fails if this policy does nothing. It stays for two
+# reasons: a workload instance with an SSM agent and an instance profile is what
+# a real one looks like, which is the point of the VM; and if Instruqt enables
+# the `ssmmessages` and `ec2messages` prefixes for this team, moving back to Run
+# Command becomes a change to scripts/cloud_vpc.py with no Terraform work.
 resource "aws_iam_role_policy_attachment" "test_vm_ssm" {
   role       = aws_iam_role.test_vm.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -214,6 +275,7 @@ resource "aws_instance" "test_vm" {
   subnet_id              = aws_subnet.workload_a.id
   vpc_security_group_ids = [aws_security_group.test_vm.id]
   iam_instance_profile   = aws_iam_instance_profile.test_vm.name
+  key_name               = aws_key_pair.test_vm.key_name
 
   # NO PACKAGE INSTALLS HERE. Not because the subnet cannot reach the internet —
   # since the move to a public subnet it can — but because a boot that depends on
@@ -222,14 +284,17 @@ resource "aws_instance" "test_vm" {
   # then called a binary that was not always present.
   #
   # scripts/cloud_vpc.py queries DNS with a pure-stdlib Python client instead,
-  # run over SSM. Amazon Linux 2023 ships python3, so the VM needs nothing.
+  # copied over SSH and run with the preinstalled python3, so the VM needs
+  # nothing beyond what the AMI ships.
   #
   # THE DIAGNOSTIC BLOCK BELOW writes to /dev/console, which means
-  # `aws ec2 get-console-output` can read it. That is the whole point: until now
-  # SSM was both the thing under test and the only instrument, so every theory
-  # about why Run Command hangs cost a track restart to disprove — four of them
-  # did, and each was wrong. Console output needs nothing on the instance role,
-  # no log group, no agent, and it works precisely when SSM does not.
+  # `aws ec2 get-console-output` can read it — needing only the `ec2` prefix and
+  # nothing on the instance itself. It exists because the exec path and the only
+  # instrument for debugging the exec path must not be the same thing: under SSM
+  # they were, and four consecutive theories about why Run Command hung each
+  # survived a track restart before being disproved. Under SSH the same trap is
+  # there (a VM you cannot reach is a VM you cannot ask why), so the console
+  # block now reports sshd first and the SSM agent second.
   #
   # ESCAPING: Terraform templates BOTH `${...}` and `%{...}` inside a heredoc,
   # so a bash variable must be written `$${...}` and a curl format string
@@ -245,41 +310,42 @@ resource "aws_instance" "test_vm" {
       for delay in 30 45 60 120 240; do
         sleep $${delay}
         {
-          echo "=== LAB_SSM_DIAG start (uptime $${SECONDS}s) ==="
-          echo "-- agent unit --"
+          echo "=== LAB_VM_DIAG start (uptime $${SECONDS}s) ==="
+          echo "-- sshd: THE PATH THE CHECKS USE --"
+          systemctl is-active sshd 2>&1
+          ss -lntp 2>/dev/null | grep -E ':22\s' || echo "  nothing listening on 22"
+          echo "  authorized_keys: $(wc -l < /home/ec2-user/.ssh/authorized_keys 2>/dev/null || echo MISSING)"
+          echo "-- ssm agent (not load-bearing; kept for realism) --"
           systemctl is-active amazon-ssm-agent 2>&1
-          echo "-- agent log --"
-          tail -n 25 /var/log/amazon/ssm/amazon-ssm-agent.log 2>&1
-          echo "-- agent errors --"
-          tail -n 15 /var/log/amazon/ssm/errors.log 2>&1
-          echo "-- can the agent reach its endpoints? --"
+          tail -n 10 /var/log/amazon/ssm/amazon-ssm-agent.log 2>&1
+          echo "-- endpoint reachability --"
           for host in ssm ssmmessages ec2messages; do
             code=$(curl -s -o /dev/null -w '%%{http_code}' --max-time 5 \
                    "https://$${host}.$${REGION}.amazonaws.com/" 2>&1)
             echo "  $${host}: HTTP $${code}"
           done
-          echo "=== LAB_SSM_DIAG end ==="
+          echo "=== LAB_VM_DIAG end ==="
         } > /dev/console 2>&1
       done
     ) &
   EOT
 
-  # EVERYTHING THE AGENT NEEDS MUST EXIST BEFORE THE INSTANCE BOOTS.
+  # EVERYTHING THE VM NEEDS MUST EXIST BEFORE IT BOOTS.
   #
-  # The SSM agent's retry is exponential and reaches ~15-minute intervals within
-  # a few failures, while warm_vpc.py waits 300s. So anything missing at boot is
-  # not "slow to converge", it is a failed track start — and an intermittent one,
-  # because whether it is missing depends on how Terraform ordered a parallel
-  # apply that run.
+  # Less critical than it was — SSH has no registration step and no exponential
+  # backoff, so a VM whose network settles late simply answers late. Kept
+  # because it is still correct, because the SSM agent (still installed) does
+  # back off, and because "the route exists but the subnet is not associated
+  # with the table holding it" is a genuinely confusing state to debug.
   #
   # Terraform's IMPLICIT graph covers only what is referenced in an argument
-  # above: the subnet, the security group, the instance profile and (through it)
-  # the role. These three are NOT referenced anywhere in this resource, so
-  # without naming them here Terraform is free to create them alongside the
-  # instance, or after it:
+  # above: the subnet, the security group, the key pair, the instance profile
+  # and (through it) the role. These three are NOT referenced anywhere in this
+  # resource, so without naming them here Terraform is free to create them
+  # alongside the instance, or after it:
   #
   #   aws_route.internet
-  #       No default route, so no path to the public SSM endpoints.
+  #       No default route, so no return path for an inbound SSH session.
   #
   #   aws_route_table_association.workload_a
   #       Subtler, and the reason the route alone was not enough. A subnet with
@@ -298,8 +364,13 @@ resource "aws_instance" "test_vm" {
     aws_iam_role_policy_attachment.test_vm_ssm,
   ]
 
-  # The instance registers with SSM at boot and its metadata changes as tags
-  # are applied. Without this a later apply wants to rebuild it.
+  # The instance's metadata changes at boot as tags are applied and the AMI
+  # lookup rotates. Without this a later apply wants to rebuild it.
+  #
+  # NOTE: this also means EDITING user_data ABOVE HAS NO EFFECT on a VPC that
+  # already exists — including via `bash /opt/lab/build-vpc.sh`. To pick up a
+  # change to the console diagnostics you must taint the instance or destroy and
+  # re-apply. Harmless in a track run, which always starts from nothing.
   lifecycle {
     ignore_changes = [ami, user_data]
   }
