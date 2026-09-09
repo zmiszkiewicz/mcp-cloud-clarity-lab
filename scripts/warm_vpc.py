@@ -22,7 +22,8 @@ WHAT IT WRITES
 --------------
 `/opt/lab/vpc_status.json`:
 
-    {"ssm": "Online", "probe": "resolved", "detail": "…", "ready": true}
+    {"reach": "SSH to ec2-user@… established", "exec": "…",
+     "probe": "resolved", "detail": "…", "ready": true}
 
 `03/setup-shell` reports that rather than re-deriving it. Absent means this is
 still running, which the challenge handles without blocking.
@@ -93,7 +94,7 @@ SSM_WAIT_SECONDS = int(
 # os.environ.get() line does nothing. That creates a Python variable; it does
 # not set an environment variable, so the get() below still returns its
 # default. Change REQUIRE_TEST_VM_DEFAULT, or set the env var properly.
-REQUIRE_TEST_VM_DEFAULT = "0"
+REQUIRE_TEST_VM_DEFAULT = "1"
 
 # The environment still wins, so an Instruqt secret can override the file.
 REQUIRE_TEST_VM = os.environ.get(
@@ -117,7 +118,7 @@ def main():
 
     instance = cloud_vpc.test_vm_instance_id()
     if not instance:
-        write_status(ready=False, ssm="no test VM found", exec="skipped",
+        write_status(ready=False, reach="no test VM found", exec="skipped",
                      probe="skipped", fatal=True,
                      detail="terraform did not produce a test VM instance id")
         return 1
@@ -140,7 +141,7 @@ def main():
         print("-------------------------\n", flush=True)
 
         write_status(
-            ready=False, ssm=status, exec="skipped", probe="skipped",
+            ready=False, reach=status, exec="skipped", probe="skipped",
             fatal=True,
             detail=("The test VM never became reachable over SSH. Part 3's "
                     "verification runs commands on it, so the challenge cannot "
@@ -167,7 +168,7 @@ def main():
             print(f"   diagnosis failed: {exc}", flush=True)
         print("-------------------------\n", flush=True)
 
-        write_status(ready=False, ssm=status, exec=exec_detail, probe="skipped",
+        write_status(ready=False, reach=status, exec=exec_detail, probe="skipped",
                      fatal=REQUIRE_TEST_VM,
                      detail=f"The test VM cannot run the Part 3 probe: "
                             f"{exec_detail}")
@@ -182,14 +183,14 @@ def main():
     # -- 3. Warm-up query. Informative, not fatal. --------------------------
     answers, probe_detail = cloud_vpc.resolve_from_test_vm("amazon.com")
     if answers:
-        write_status(ready=True, ssm=status, exec=exec_detail,
+        write_status(ready=True, reach=status, exec=exec_detail,
                      probe="resolved", fatal=False,
                      detail=f"amazon.com -> {answers[0]} from inside the VPC")
         return 0
 
     # Everything Part 3 needs is present; only the convenience check failed.
     write_status(
-        ready=True, ssm=status, exec=exec_detail, probe="failed", fatal=False,
+        ready=True, reach=status, exec=exec_detail, probe="failed", fatal=False,
         detail=(f"The VM is manageable and can run the probe, but the warm-up "
                 f"query did not resolve: {probe_detail}. This does NOT block "
                 f"Part 3 — that resolves an internal name through DNS the "

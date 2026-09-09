@@ -314,14 +314,20 @@ slow things overlap instead of queueing, so step 9 is usually short.
 > "the routing that carries DNS", and turning propagation on is one API call it
 > can make. Removing it deleted the race rather than papering over it.
 
-**Budget roughly 8-13 minutes of track start**, most of it in two places:
+**Measured: the blocking wait is about 100 seconds.** The build itself runs
+~4 minutes, but it starts before the sandbox allocation, so most of it has
+already elapsed by the time step 9 blocks on it.
 
 | | Typical |
 |---|---|
-| Three SSM interface endpoints, in parallel | 3-5 min |
-| VPN gateway create and attach (`as-a-service` mode only) | 4-6 min |
-| EC2 instance to running | ~1 min |
-| SSM agent registration, plus the probe | 1-3 min |
+| VPN gateway create and attach (`as-a-service` only) | ~70s, the long pole |
+| VPC, subnets, routes, IGW, security group, keypair | ~15s |
+| EC2 instance to running | ~15s |
+| SSH reachable, then the DNS probe | ~30s |
+
+An earlier estimate here said 8-13 minutes. That was with three SSM interface
+endpoints (~55s) and SSM agent registration (1-3 min, when it worked at all);
+both are gone.
 
 The wait loop caps at 20 minutes and prints a progress line each minute, with
 the last meaningful line from the terraform log — a silent ten-minute pause is
