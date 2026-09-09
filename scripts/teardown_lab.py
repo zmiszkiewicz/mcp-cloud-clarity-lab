@@ -36,6 +36,16 @@ from csp_client import (CspClient, CspError, LabTodo, info, object_url, ok,
 
 # Reverse-dependency order. Each entry is (registry key, human label).
 DELETE_ORDER = [
+    # NIOS-X as a Service, outermost first: an access location belongs to an
+    # endpoint, an endpoint to a universal service. Deleting in the other order
+    # leaves children whose parent is gone.
+    #
+    # A tenant with no universalinfra support 404s on all three, and purge()
+    # treats that as "nothing to remove" rather than an error — the same reason
+    # service_deployment.py's seeding is non-fatal.
+    ("access_locations",    "access locations"),
+    ("endpoints",           "service endpoints"),
+    ("universal_service",   "universal services"),
     ("dns_record",          "DNS records"),
     ("dhcp_range",          "DHCP ranges"),
     ("dhcp_fixed_address",  "fixed addresses / reservations"),

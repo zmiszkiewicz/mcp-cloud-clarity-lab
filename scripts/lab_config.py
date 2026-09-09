@@ -384,11 +384,28 @@ TEST_VM_NAME = os.environ.get("LAB_TEST_VM_NAME", "techcorp-ai-test")
 # See README.md "Part 3 delivery modes" before changing this.
 C3_MODE = os.environ.get("LAB_C3_MODE", "as-a-service")
 
-# The Service Deployment the participant creates on the Infoblox side.
+# The NIOS-X as a Service objects. SEEDED, not built by the participant — the
+# Infoblox MCP Server is read-only, so nothing in the lab can create these
+# during Part 3. Seeding uses the CSP REST API with admin credentials instead,
+# and Part 3 becomes the AWS half of the deployment.
 SERVICE_DEPLOYMENT_NAME = os.environ.get(
     "LAB_SERVICE_DEPLOYMENT", "techcorp-ai-vpc-dns"
 )
+ENDPOINT_NAME = os.environ.get("LAB_ENDPOINT_NAME", "techcorp-ai-vpc-endpoint")
 ACCESS_LOCATION_NAME = os.environ.get("LAB_ACCESS_LOCATION", "techcorp-ai-vpc-aws")
+
+# The endpoint's anycast/VIP address, which the VPC's DHCP option set will
+# eventually point at. Pinned rather than left to the assistant to invent: the
+# Part 3 check needs to know where to send its query, and "10.40.0.53" chosen
+# on the fly is not something a check can predict.
+#
+# Inside the VPC CIDR but outside both workload subnets, so it cannot collide
+# with an instance address.
+SERVICE_IP = os.environ.get("LAB_SERVICE_IP", "10.40.0.53")
+
+# Instance size for the endpoint. Validated against GET /supportedsizes at seed
+# time, which is also how you find out what else is on offer.
+ENDPOINT_SIZE = os.environ.get("LAB_ENDPOINT_SIZE", "SMALL")
 
 # Where the check reads the DNS service IP from once it exists. Written by
 # 03/check-shell via terraform output, or by the participant's own work.
@@ -478,22 +495,30 @@ PATHS = {
     # Each Todo id maps to a row in README.md "TODO punch list".
     # ---------------------------------------------------------------------- #
 
-    "service_deployment": Todo(
-        "TODO-31",
-        "What is the REST path for a NIOS-X as a Service *Service Deployment*, "
-        "and for the Access Locations under it? There is no package for this in "
-        "the public universal-ddi-go-client (inframgmt covers Hosts and "
-        "Services only), so it needs answering from the CSP API docs directly. "
-        "Part 3's Infoblox-side check falls back to the dig probe from the test "
-        "VM while this is unanswered, which still validates the outcome — it "
-        "just cannot name the object that produced it.",
-    ),
-    "access_location": Todo(
-        "TODO-32",
-        "REST path for Access Locations, and which field carries the Cloud "
-        "Service IP the test VM must query. Part 3 step 3 needs that IP; today "
-        "it is read from terraform output or supplied via LAB_DNS_SERVICE_IP.",
-    ),
+    # ---------------------------------------------------------------------- #
+    # NIOS-X as a Service. Base path /api/universalinfra/v1.
+    #
+    # Not in the public universal-ddi-go-client — these were read out of the
+    # MCP server's own tool schemas against a live tenant. Creation order is
+    # strict, because each needs the id of the one above it:
+    #
+    #   universalservices -> endpoints -> accesslocations
+    # ---------------------------------------------------------------------- #
+    "universal_service":  "/api/universalinfra/v1/universalservices",
+    "endpoints":          "/api/universalinfra/v1/endpoints",
+    "access_locations":   "/api/universalinfra/v1/accesslocations",
+    "supported_sizes":    "/api/universalinfra/v1/supportedsizes",
+
+    # Locations live under the infra API, not universalinfra.
+    "infra_locations":    "/api/infra/v1/locations",
+
+    # What a Universal Service is actually serving. Read-only: there is no POST
+    # here. The association is made by giving the service a DNS capability
+    # whose profile_id points at a dns/server config profile, and by the zone
+    # carrying primary_type "cloud".
+    "us_associations":
+        "/api/ddi/v1/dns/universal_service/{service_id}/associations",
+
     "dhcp_lease": Todo(
         "TODO-15",
         "Which endpoint LISTS active DHCP leases? The ipam package only exposes "

@@ -166,7 +166,10 @@ once the Infoblox side is built, and building it is the point of the challenge.
   The assistant collapses that, which is exactly the demo — but it is a lot of
   live API work inside a fifteen-minute part, and BGP convergence adds minutes
   that are not in anyone's control.
-- The Service Deployment REST surface is unconfirmed (TODO-31/32).
+- The Access Location cannot be pre-seeded: its WAN IPs are the AWS VPN's
+  outside addresses, which do not exist until the VPN is created. So Part 3
+  keeps one Portal step. The Universal Service and endpoint above it *are*
+  pre-seeded, by `scripts/service_deployment.py`.
 
 ### `forwarder` — the fallback
 

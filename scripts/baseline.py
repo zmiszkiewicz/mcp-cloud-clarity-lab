@@ -24,6 +24,7 @@ findings shape this file and are worth knowing before editing:
 """
 
 import lab_config as cfg
+import service_deployment
 from csp_client import info, object_url, ok
 
 
@@ -486,6 +487,21 @@ def build_all(client):
     set_authoritative_servers(client, zone["id"], authority, attached=True)
     ok(f"{cfg.ZONE_FQDN} is authoritative on {authority['name']}")
 
+    # Part 3's Infoblox side. NON-FATAL: a tenant missing a prerequisite still
+    # gives a working Parts 1, 2 and 4, and failing the whole seed over Part 3
+    # would trade three working challenges for none.
+    service = {}
+    try:
+        service = service_deployment.build(client)
+    except service_deployment.ServiceSeedingUnavailable as exc:
+        print(f"⚠️  Part 3's DNS service was not created: {exc}", flush=True)
+        print("    Parts 1, 2 and 4 are unaffected. Part 3 will say so.",
+              flush=True)
+    except Exception as exc:                            # noqa: BLE001
+        print(f"⚠️  Part 3's DNS service could not be created: {exc}",
+              flush=True)
+        print("    Parts 1, 2 and 4 are unaffected.", flush=True)
+
     print("\n=== Baseline: IPAM / DHCP ===", flush=True)
     space = ensure_ip_space(client)
     ensure_address_block(client, space["id"])
@@ -505,6 +521,9 @@ def build_all(client):
         "dns_server_id": authority["id"],
         "dns_server_name": authority["name"],
         "space_id": space["id"],
+        # Part 3's ids, already namespaced. Empty when the tenant could not
+        # support them; Part 3's check reports that rather than KeyError-ing.
+        **service,
         "dc_subnet_id": subnets["dc-01"]["id"],
         "branch_subnet_id": branch["id"],
         "range_id": dhcp_range["id"],

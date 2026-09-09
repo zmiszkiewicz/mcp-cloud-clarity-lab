@@ -179,39 +179,71 @@ def check_zone_resolves():
 
 def check_c3(client, ids):
     """
-    The track flow asks for two things:
+    Three conditions, weighted by who is responsible for them:
 
-      1. The new DNS service exists in Universal DDI and reports healthy.
-      2. A query from the test VM against the service resolves the internal zone.
+      1. The Universal Service exists.        SEEDING built this, not the
+                                              participant. Checked as an
+                                              environment sanity test, and a
+                                              failure here is reported as the
+                                              track's fault rather than theirs.
+      2. An Access Location is attached.      Participant work — Step 3.
+      3. The test VM resolves the zone.       Participant work, load-bearing.
 
-    (2) is the load-bearing one and it runs unconditionally. It is also the only
-    one of the two that cannot be satisfied by a half-built deployment: a
-    Service Deployment that exists but has no working path into the VPC will
-    pass an object-existence check and fail a dig, and the dig is what the cloud
-    team actually cares about.
+    (3) is the one that matters, and it runs unconditionally. It is the only one
+    that cannot be satisfied by a half-built deployment: a service that exists
+    but has no working path into the VPC passes an object-existence check and
+    fails a dig, and the dig is what the cloud team actually cares about.
 
-    (1) is best-effort. The NIOS-X as a Service REST surface is not in the
-    public API client (TODO-31), so where the Infoblox-side object cannot be
-    read the check says so and leans on (2).
+    The distinction in (1) is the point. Since scripts/service_deployment.py
+    pre-creates the service at boot, its presence proves nothing about the
+    participant — telling them "you have not created the service yet" when the
+    track failed to create it would send them hunting for work that was never
+    theirs.
     """
     import cloud_vpc
     from cloud_vpc import CloudUnavailable
 
-    # -- 1. Infoblox side ----------------------------------------------------
+    # -- 1. The service seeding built ----------------------------------------
+    service = None
     try:
-        deployments = client.list_results(cfg.path("service_deployment"))
+        deployments = client.list_results(cfg.path("universal_service"))
         named = [d for d in deployments
                  if d.get("name") == cfg.SERVICE_DEPLOYMENT_NAME]
         if not named:
-            fail(f"No Service Deployment named "
-                 f"'{cfg.SERVICE_DEPLOYMENT_NAME}' exists in Universal DDI. "
-                 f"Ask the assistant to create the DNS service for "
-                 f"{cfg.VPC_NAME} before checking.")
-        ok(f"Service Deployment {cfg.SERVICE_DEPLOYMENT_NAME} exists")
+            # Not the participant's fault, and the wording has to say so.
+            fail(f"The Universal Service '{cfg.SERVICE_DEPLOYMENT_NAME}' does "
+                 f"not exist. It is created when the track starts, not by you, "
+                 f"so this is an environment fault — tell your facilitator, and "
+                 f"check the 'NIOS-X as a Service' section of the seeding log.")
+        service = named[0]
+        ok(f"Universal Service {cfg.SERVICE_DEPLOYMENT_NAME} exists "
+           f"(built at track start)")
     except LabTodo as todo:
         info(f"Infoblox-side service check unavailable — {todo}")
     except CspError as exc:
         info(f"Infoblox-side service lookup failed: {exc}")
+
+    # -- 2. The access location the participant added ------------------------
+    #
+    # This one IS theirs: it needs the VPN's outside addresses, which do not
+    # exist until Step 2 creates the VPN, so it cannot be pre-built. Advisory
+    # rather than fatal — (3) is the real proof, and if DNS resolves then the
+    # path plainly works whatever this endpoint reports.
+    if service is not None:
+        try:
+            locations = client.list_results(cfg.path("access_locations"))
+            mine = [loc for loc in locations
+                    if loc.get("name") == cfg.ACCESS_LOCATION_NAME]
+            if mine:
+                wan = mine[0].get("wan_ip_addresses") or []
+                ok(f"Access Location {cfg.ACCESS_LOCATION_NAME} exists "
+                   f"({len(wan)} WAN address(es))")
+            else:
+                info(f"no Access Location named "
+                     f"'{cfg.ACCESS_LOCATION_NAME}' yet — Step 3 adds it with "
+                     f"the VPN's outside addresses")
+        except (LabTodo, CspError) as exc:
+            info(f"could not read access locations: {exc}")
 
     # A DNS service on a Universal DDI host is readable today, so check that
     # too. In `forwarder` mode this is the object doing the work.
@@ -230,7 +262,7 @@ def check_c3(client, ids):
     except CspError as exc:
         info(f"could not list infrastructure services: {exc}")
 
-    # -- 2. Resolution from inside the VPC ----------------------------------
+    # -- 3. Resolution from inside the VPC ----------------------------------
     #
     # Everything from here on talks to AWS. boto3 missing, or credentials that
     # do not resolve, raises CloudUnavailable from deep inside these helpers —

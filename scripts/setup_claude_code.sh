@@ -188,6 +188,18 @@ The AWS MCP server DOES accept writes. For anything on the AWS side, state what
 you intend to change and wait for approval before executing it. There is no
 dry-run; it takes effect immediately against a real account.
 
+CLOUD DNS DEPLOYMENT. A NIOS-X as a Service deployment and its endpoint ALREADY
+EXIST in this tenant — read them before proposing anything, and do not offer to
+create them. The work that remains is the AWS side: a customer gateway and
+Site-to-Site VPN from the VPC's existing VPN gateway, route propagation on the
+route table, and a DHCP options set pointing the VPC at the endpoint address.
+
+One object genuinely cannot be created by either of us: the Access Location,
+which needs the VPN connection's outside IP addresses as its WAN IPs. Those do
+not exist until you create the VPN. So once the VPN is up, read its two outside
+addresses and give them to the engineer to enter in the Portal, then verify the
+access location once they say it is done.
+
 When diagnosing, distinguish what is CONFIGURED from what is actually HAPPENING.
 Most real faults live in the gap between the two: a zone that exists is not a
 zone that is being served, and a DHCP range that exists is not a range that can
