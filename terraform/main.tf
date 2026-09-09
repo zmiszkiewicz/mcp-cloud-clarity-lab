@@ -224,24 +224,31 @@ resource "aws_vpn_gateway" "lab" {
   tags = { Name = "${local.vpc_name}-vgw" }
 }
 
-resource "aws_vpn_gateway_route_propagation" "private" {
-  count = var.c3_mode == "as-a-service" ? 1 : 0
+# NO ROUTE PROPAGATION HERE — that is Part 3's work, and it was also racy.
+#
+# `aws_vpn_gateway_route_propagation` failed the build immediately after the
+# gateway finished creating. Enabling propagation needs the VPC attachment to
+# be fully `attached`, and AWS reports the gateway as created slightly before
+# that is consistently true, so the call intermittently fails.
+#
+# It should not have been here anyway. Part 3's assignment already tells the
+# participant the assistant will create "the connection from the VPC to the
+# Infoblox point of presence, AND THE ROUTING THAT CARRIES DNS TO IT" — that is
+# this. Enabling propagation is one AWS API call the assistant can make, it is
+# instructive, and it belongs on the participant's side of the line this file's
+# header draws: slow and boring here, fast and instructive there.
+#
+# Removing it also deletes the race rather than papering over it with a sleep.
 
-  vpn_gateway_id = aws_vpn_gateway.lab[0].id
-  route_table_id = aws_route_table.private.id
-}
-
-# Reaching the on-prem space over the tunnel. Propagation above handles this
-# once BGP is up; the static route is the belt to that braces, and it makes the
-# intent legible in the console while the participant is looking at it.
+# A static route to the corporate space, so the route table shows intent while
+# the participant is looking at it. Not subject to the same race: adding a
+# route to a gateway does not require the attachment to have settled.
 resource "aws_route" "on_prem" {
   count = var.c3_mode == "as-a-service" ? 1 : 0
 
   route_table_id         = aws_route_table.private.id
   destination_cidr_block = var.on_prem_cidr
   gateway_id             = aws_vpn_gateway.lab[0].id
-
-  depends_on = [aws_vpn_gateway_route_propagation.private]
 }
 
 # --------------------------------------------------------------------------- #

@@ -307,6 +307,13 @@ Two things run at track start, concurrently:
 Starting the build before the broker call is what keeps the gate cheap: the two
 slow things overlap instead of queueing, so step 9 is usually short.
 
+> **Route propagation is deliberately not pre-created.** It failed the build
+> intermittently — enabling it needs the VPC attachment fully settled, and AWS
+> reports the gateway created slightly before that is reliably true. It is also
+> better as participant work: Part 3 already promises the assistant will build
+> "the routing that carries DNS", and turning propagation on is one API call it
+> can make. Removing it deleted the race rather than papering over it.
+
 **Budget roughly 8-13 minutes of track start**, most of it in two places:
 
 | | Typical |
