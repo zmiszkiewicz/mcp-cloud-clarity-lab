@@ -204,6 +204,100 @@ def ssm_registered(instance_id, wait=0):
         time.sleep(5)
 
 
+def run_on_test_vm(command, timeout=120, instance_id=None):
+    """
+    Run one shell command on the test VM. Returns a result dict:
+
+        {"ok": bool, "status": "Success", "rc": 0,
+         "stdout": "...", "stderr": "...", "detail": "..."}
+
+    Everything the probe does goes through here so that a failure reports what
+    actually happened. An earlier version returned only "no output from the
+    probe", which was true and useless: it did not say whether the command
+    failed, timed out, or ran fine and printed nothing.
+    """
+    instance_id = instance_id or test_vm_instance_id()
+    if not instance_id:
+        return {"ok": False, "status": "no-instance", "rc": None,
+                "stdout": "", "stderr": "",
+                "detail": "no test VM instance id available"}
+
+    ssm = _client("ssm")
+    try:
+        sent = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [command]},
+            TimeoutSeconds=60,
+        )
+    except Exception as exc:                            # noqa: BLE001
+        return {"ok": False, "status": "send-failed", "rc": None,
+                "stdout": "", "stderr": "",
+                "detail": f"SSM send_command failed: {exc}"}
+
+    command_id = sent["Command"]["CommandId"]
+    deadline = time.time() + timeout
+    invocation = None
+
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            invocation = ssm.get_command_invocation(
+                CommandId=command_id, InstanceId=instance_id
+            )
+        except ssm.exceptions.InvocationDoesNotExist:
+            continue
+        if invocation["Status"] not in ("Pending", "InProgress", "Delayed"):
+            break
+
+    if not invocation:
+        return {"ok": False, "status": "no-invocation", "rc": None,
+                "stdout": "", "stderr": "",
+                "detail": f"no SSM invocation appeared within {timeout}s"}
+
+    status = invocation.get("Status")
+    rc = invocation.get("ResponseCode")
+    stdout = (invocation.get("StandardOutputContent") or "").strip()
+    stderr = (invocation.get("StandardErrorContent") or "").strip()
+
+    detail = f"status={status} rc={rc}"
+    if stderr:
+        detail += f" stderr={stderr[:300]}"
+    if not stdout and not stderr:
+        detail += " (both streams empty)"
+
+    return {"ok": status == "Success" and rc == 0,
+            "status": status, "rc": rc,
+            "stdout": stdout, "stderr": stderr, "detail": detail}
+
+
+def test_vm_can_run_commands(instance_id=None):
+    """
+    Can we execute anything at all on the VM, and is python3 there?
+
+    Separate from the DNS question on purpose. These two are what Part 3
+    genuinely requires — its check runs a Python DNS client over SSM — whereas
+    whether a *public* name resolves at boot is a convenience, and not even the
+    path Part 3 exercises. Conflating them meant a public-DNS quirk failed the
+    whole track start.
+    """
+    result = run_on_test_vm(
+        "echo LAB_EXEC_OK; python3 -c 'import sys; print(sys.version.split()[0])'",
+        instance_id=instance_id,
+    )
+    if not result["ok"]:
+        return False, f"could not run a command on the VM — {result['detail']}"
+    if "LAB_EXEC_OK" not in result["stdout"]:
+        return False, (f"command ran but produced unexpected output — "
+                       f"{result['detail']} stdout={result['stdout'][:200]!r}")
+
+    version = [l for l in result["stdout"].splitlines() if l != "LAB_EXEC_OK"]
+    if not version:
+        return False, ("python3 is not available on the test VM. The DNS probe "
+                       "needs it, and the subnet has no internet to install it.")
+    return True, f"commands run; python3 {version[0]}"
+
+
 def resolve_from_test_vm(fqdn, resolver=None, timeout=120, ssm_wait=0):
     """
     Resolve a name FROM INSIDE the VPC and return the answers.
@@ -237,48 +331,16 @@ def resolve_from_test_vm(fqdn, resolver=None, timeout=120, ssm_wait=0):
     command = (f"echo {payload} | base64 -d > /tmp/dnsprobe.py && "
                f"python3 /tmp/dnsprobe.py {fqdn} {resolver or ''}")
 
-    ssm = _client("ssm")
-    try:
-        sent = ssm.send_command(
-            InstanceIds=[instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [command]},
-            TimeoutSeconds=60,
-        )
-    except Exception as exc:                            # noqa: BLE001
-        return [], (f"Could not run a command on the test VM through SSM "
-                    f"({exc}). Check that `ssm` is in the AWS services list "
-                    f"in config.yml.")
+    result = run_on_test_vm(command, timeout=timeout, instance_id=instance_id)
 
-    command_id = sent["Command"]["CommandId"]
-    deadline = time.time() + timeout
-    invocation = None
-
-    while time.time() < deadline:
-        time.sleep(3)
-        try:
-            invocation = ssm.get_command_invocation(
-                CommandId=command_id, InstanceId=instance_id
-            )
-        except ssm.exceptions.InvocationDoesNotExist:
-            continue
-        if invocation["Status"] not in ("Pending", "InProgress", "Delayed"):
-            break
-
-    if not invocation:
-        return [], (f"The DNS probe on the test VM did not return within "
-                    f"{timeout}s.")
-
-    stdout = (invocation.get("StandardOutputContent") or "").strip()
-    stderr = (invocation.get("StandardErrorContent") or "").strip()
-
-    answers = [line.strip() for line in stdout.splitlines() if line.strip()]
+    answers = [line.strip() for line in result["stdout"].splitlines()
+               if line.strip()]
     if answers:
-        return answers, stdout
+        return answers, result["stdout"]
 
     where = f"via {resolver}" if resolver else "via the VM's own resolver"
     return [], (f"{fqdn} did not resolve from inside the VPC {where}. "
-                f"{stderr or 'no output from the probe'}")
+                f"{result['detail']}")
 
 
 # --------------------------------------------------------------------------- #

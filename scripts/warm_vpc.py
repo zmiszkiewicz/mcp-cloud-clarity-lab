@@ -26,11 +26,24 @@ WHAT IT WRITES
 `03/setup-shell` reports that rather than re-deriving it. Absent means this is
 still running, which the challenge handles without blocking.
 
-EXITS NON-ZERO IF THE VM IS NOT USABLE. A VPC whose test VM cannot be reached
-is not a lab that can complete Part 3 — the load-bearing check runs `dig` on
-that VM. Better to fail the track at boot, where the participant loses nothing
-but a restart, than thirty minutes in, where they lose the work they have done.
-track_scripts/setup-shell blocks on this and fails the track start.
+WHAT FAILS THE TRACK, AND WHAT DOES NOT
+---------------------------------------
+Three separate questions, and only two of them are fatal:
+
+  1. Is the VM manageable through SSM?        FATAL — nothing can run on it.
+  2. Can we run a command, and is python3     FATAL — Part 3's check is a
+     there?                                     Python DNS client run over SSM.
+  3. Does a public name resolve from it?      WARNING ONLY.
+
+(3) used to be fatal and should not have been. It is not the path Part 3
+exercises — that one resolves an *internal* name through infrastructure the
+participant has not built yet — so a quirk in public DNS resolution at boot
+would fail a track whose Part 3 was perfectly capable of succeeding. It is kept
+as a warm-up because when it does work it proves the whole chain end to end.
+
+(1) and (2) genuinely make Part 3 impossible, and better to fail at boot, where
+the participant loses a restart, than thirty minutes in, where they lose their
+work. track_scripts/setup-shell blocks on this and fails the track start.
 """
 
 import json
@@ -59,36 +72,58 @@ def write_status(**fields):
 def main():
     instance = cloud_vpc.test_vm_instance_id()
     if not instance:
-        write_status(ready=False, ssm="no test VM found", probe="skipped",
+        write_status(ready=False, ssm="no test VM found", exec="skipped",
+                     probe="skipped", fatal=True,
                      detail="terraform did not produce a test VM instance id")
         return 1
 
+    # -- 1. Manageable at all? ---------------------------------------------
     print(f"waiting for SSM to adopt {instance} "
           f"(up to {SSM_WAIT_SECONDS}s)...", flush=True)
     online, status = cloud_vpc.ssm_registered(instance, wait=SSM_WAIT_SECONDS)
-
     if not online:
         write_status(
-            ready=False, ssm=status, probe="skipped",
+            ready=False, ssm=status, exec="skipped", probe="skipped",
+            fatal=True,
             detail=("The test VM never became manageable through SSM. Part 3's "
-                    "verification runs commands on it, so step 3 will not work. "
-                    "Check that `ssm` is in the AWS services list in config.yml, "
-                    "that the three SSM interface endpoints came up, and that "
-                    "the instance profile is attached."),
+                    "verification runs commands on it, so the challenge cannot "
+                    "work. Check that `ssm` is in the AWS services list in "
+                    "config.yml, that the three SSM interface endpoints came "
+                    "up, and that the instance profile is attached."),
         )
         return 1
+    print(f"   SSM: {status}", flush=True)
 
-    # One warm-up query against a public name. It proves the whole path — SSM
-    # transport, python3 on the VM, the DNS client itself — without depending on
-    # anything the participant has not built yet.
-    answers, detail = cloud_vpc.resolve_from_test_vm("amazon.com")
+    # -- 2. Can we actually execute, and is python3 present? ----------------
+    can_run, exec_detail = cloud_vpc.test_vm_can_run_commands(instance)
+    print(f"   exec: {exec_detail}", flush=True)
+    if not can_run:
+        write_status(ready=False, ssm=status, exec=exec_detail, probe="skipped",
+                     fatal=True,
+                     detail=f"The test VM cannot run the Part 3 probe: "
+                            f"{exec_detail}")
+        return 1
+
+    # -- 3. Warm-up query. Informative, not fatal. --------------------------
+    answers, probe_detail = cloud_vpc.resolve_from_test_vm("amazon.com")
     if answers:
-        write_status(ready=True, ssm=status, probe="resolved",
+        write_status(ready=True, ssm=status, exec=exec_detail,
+                     probe="resolved", fatal=False,
                      detail=f"amazon.com -> {answers[0]} from inside the VPC")
         return 0
 
-    write_status(ready=False, ssm=status, probe="failed", detail=detail)
-    return 1
+    # Everything Part 3 needs is present; only the convenience check failed.
+    write_status(
+        ready=True, ssm=status, exec=exec_detail, probe="failed", fatal=False,
+        detail=(f"The VM is manageable and can run the probe, but the warm-up "
+                f"query did not resolve: {probe_detail}. This does NOT block "
+                f"Part 3 — that resolves an internal name through DNS the "
+                f"participant builds, which does not exist yet. Worth a look "
+                f"if step 3 later fails too."),
+    )
+    print("⚠️  warm-up query failed; not fatal — see the detail above",
+          flush=True)
+    return 0
 
 
 if __name__ == "__main__":
