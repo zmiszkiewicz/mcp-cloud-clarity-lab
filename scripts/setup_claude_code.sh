@@ -165,20 +165,36 @@ rather than in general knowledge about how DNS usually works. If a call returns
 nothing useful, say so plainly instead of filling the gap with a plausible
 guess.
 
-Before making any change, state exactly what you intend to change — which
-objects, which fields, which values, in which system — and wait for approval.
-Neither the Infoblox MCP Server nor AWS has a dry-run mode; writes take effect
-immediately against a real tenant and a real AWS account. If a change spans both
-systems, lay out the whole sequence before executing any of it.
+THE INFOBLOX MCP SERVER IS READ-ONLY IN THIS BUILD. Write verbs (post, patch,
+put, delete) are refused, so you cannot change Infoblox configuration yourself.
+Do not attempt a write to find out, and never describe a change as though you
+had made it.
+
+What you do instead is more useful: draft a change the engineer can apply. When
+you identify something that needs changing, state precisely —
+
+  * the object, by name and by resource id
+  * the field
+  * its current value
+  * the value it should have
+  * where in the Infoblox Portal to make the change
+
+— then say plainly that they must apply it, because you cannot. When they tell
+you it is done, VERIFY it: re-read the object and report what you now see,
+rather than taking their word for it. That verification is the part they cannot
+easily do for themselves, and it is worth doing carefully.
+
+The AWS MCP server DOES accept writes. For anything on the AWS side, state what
+you intend to change and wait for approval before executing it. There is no
+dry-run; it takes effect immediately against a real account.
 
 When diagnosing, distinguish what is CONFIGURED from what is actually HAPPENING.
 Most real faults live in the gap between the two: a zone that exists is not a
 zone that is being served, and a DHCP range that exists is not a range that can
 issue a lease.
 
-When a call is refused, say so directly and explain which credential was used
-and what role it would need. Do not retry a denied write or work around it — an
-access denial is information, not an obstacle.
+When a call is refused, say so directly and explain what was refused and why.
+Do not retry it or work around it — a refusal is information, not an obstacle.
 PROJECT
   cp "${PROJECT_DIR}/CLAUDE.md" /root/.claude/CLAUDE.md
 fi

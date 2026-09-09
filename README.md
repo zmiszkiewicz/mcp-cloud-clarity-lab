@@ -426,6 +426,29 @@ answers.
 VM" and "the VM cannot resolve" are different problems with different owners,
 and reporting both as one timeout wastes the time of whoever is debugging.
 
+## The MCP server is read-only
+
+Every Infoblox write verb is refused by the server, regardless of role:
+
+```
+Write actions (post, patch, put, delete) are not available.
+```
+
+`check_mcp_role.py --probe-write` is the diagnostic that settled it: it reads
+the identity the key authenticates as, then makes the same class of write
+directly against the CSP REST API. The direct write succeeds. Same key, same
+account — so the constraint is the MCP server, not the credential.
+
+Worth knowing before you go looking: the service user is in
+`ib-mcp-server-admin` from the moment it is created, and always was. A whole
+evening went into role changes and key re-mints that could not have helped,
+because the setup log had already said so.
+
+The lab works around it with a diagnose → apply → verify loop; the assistant
+drafts the change, the participant applies it in the Portal, and the assistant
+reads it back. `setup_claude_code.sh` writes the instruction that produces that
+behaviour into the project CLAUDE.md.
+
 ## Design notes
 
 **Checks read the API, never the transcript.** The assistant's wording is
