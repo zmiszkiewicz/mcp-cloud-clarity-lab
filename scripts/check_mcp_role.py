@@ -84,6 +84,43 @@ def report_groups(admin):
                   "refused. Set MCP_RW_GROUP to the admin group's real name.")
 
 
+def whoami(api_key):
+    """
+    Which CSP identity does this key actually authenticate as?
+
+    The decisive question when someone has changed a role in the Portal and it
+    has not taken effect: did they change the user this key belongs to? The
+    key's own view is the only authoritative answer — the user's display name
+    in the Portal need not match the name provision_mcp_keys.py asked for.
+    """
+    client = CspClient.from_service_key(api_key)
+
+    try:
+        payload = client.get(cfg.path("current_user"))
+    except CspError as exc:
+        print(f"\n  key identity: could not read /v2/current_user ({exc})")
+        return
+
+    user = payload.get("result", payload)
+    print("\n  the MCP key authenticates as:")
+    print(f"    name:  {user.get('name')}")
+    print(f"    email: {user.get('email')}")
+    print(f"    id:    {user.get('id')}")
+    print("    → THIS is the user whose role governs the key. If you changed a "
+          "different one in the Portal, the change will not apply.")
+
+    for field in ("group_ids", "groups"):
+        if user.get(field):
+            print(f"    {field}: {user[field]}")
+
+    try:
+        account = client.get(cfg.path("current_account"))
+        acct = account.get("result", account)
+        print(f"    account: {acct.get('name')} ({acct.get('id')})")
+    except CspError:
+        pass
+
+
 def probe_write(api_key):
     """
     Attempt a write straight at the CSP REST API with the MCP key.
@@ -138,14 +175,25 @@ def main():
     ok(f"authenticated against sandbox {admin.account_id}")
     report_groups(admin)
 
+    key = read_state("mcp_key", required=False)
+    if not key:
+        info("no mcp_key.txt — cannot inspect the key")
+        return 0
+
+    whoami(key)
+
     if args.probe_write:
-        key = read_state("mcp_key", required=False)
-        if not key:
-            info("no mcp_key.txt — cannot probe")
-        else:
-            probe_write(key)
+        probe_write(key)
     else:
         print("\n  (run with --probe-write to test an actual write)")
+
+    print("\n  If you changed a role in the Portal and Claude Code still "
+          "refuses writes:")
+    print("    1. Restart Claude Code (Ctrl-C, then `claude`). It fetches the "
+          "MCP tool list at connect time and caches it for the session.")
+    print("    2. Confirm the user above is the one you edited.")
+    print("    3. Re-run this with --probe-write. A direct CSP write that "
+          "succeeds while MCP still refuses means the server, not the role.")
 
     return 0
 
