@@ -224,16 +224,23 @@ def resolve_role_groups(admin):
 
 def ensure_user(admin, name, email, group_ids, password):
     """
-    Create one MCP user in one group. Idempotent — a re-run finds the existing
-    user by name rather than creating a second.
+    Create one MCP user. Idempotent — a re-run finds the existing user rather
+    than creating a second.
 
-    Mirrors the estate's user_provision.py, including the 409-means-it-exists
-    handling, but with the role-scoped groups above instead of user+act_admin.
+    MATCHED ON EMAIL, NOT NAME. CSP does not store the `name` we send: a user
+    created as `mcp-rw-<participant>` comes back with the display name
+    `mcp mcp`. So a name lookup never matches, and every re-run of this script
+    silently created ANOTHER user with another key — which matters most exactly
+    when you are re-running it, after changing a role and wanting a fresh key
+    for the SAME identity.
+
+    The email is ours, unique per participant, and CSP keeps it verbatim.
     """
-    existing = admin.find_by_name(cfg.path("users"), name)
+    existing = (admin.find_by_name(cfg.path("users"), email, field="email")
+                or admin.find_by_name(cfg.path("users"), name))
     if existing:
         user_id = existing["id"].split("/")[-1]
-        info(f"user {name} already exists ({user_id})")
+        info(f"user {email} already exists ({user_id}), reusing it")
     else:
         created = admin.post(cfg.path("users"), json_body={
             "name": name,
@@ -245,6 +252,17 @@ def ensure_user(admin, name, email, group_ids, password):
         if not user_id:
             raise SystemExit(f"❌ user create for {name} returned no id: {created}")
         ok(f"created user {name} ({user_id})")
+
+    # Re-assert group membership on every run. A re-run is usually BECAUSE the
+    # roles changed, so leaving an existing user's groups alone would defeat
+    # the point of re-running.
+    if group_ids:
+        try:
+            admin.patch(f"{cfg.path('users')}/{user_id}",
+                        json_body={"group_ids": group_ids})
+            info(f"group membership re-asserted for {email}")
+        except CspError as exc:
+            print(f"⚠️  could not update groups for {email}: {exc}", flush=True)
 
     # Always (re)set the password — we need to know it to sign in as this user,
     # and on a re-run we do not have the one from last time.
