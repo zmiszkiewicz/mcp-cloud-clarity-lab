@@ -21,6 +21,8 @@ scripts/
   revoke_mcp_keys.py    idempotent key revoke + service user delete
   teardown_lab.py       remove seeded objects; safe to run twice
   preflight.sh          offline checks; run before every git push
+  warm_vpc.py           boot-time: wait for SSM, prove a command runs on the VM
+  lab-dig               run a DNS query on the test VM, from the Terminal tab
   setup_claude_code.sh  install + configure Claude Code and both MCP servers
   pick_bedrock_model.py verify the pinned model is invokable in this account
   traffic/README.md     iq-insighter wiring (TODO-19)
@@ -285,6 +287,26 @@ key: user administration is not exposed through the MCP Server at all.
 `MCP_ROLES=read_only,read_write` restores the two-key flow —
 `provision_mcp_keys.py`, `revoke_mcp_keys.py` and `check_c4` all still support
 it.
+
+## Part 3 does its waiting at boot, not in Part 3
+
+Nothing slow happens when the participant opens Part 3. `track_scripts/setup-shell`
+backgrounds the whole thing at track start:
+
+| At boot, backgrounded | Why there |
+|---|---|
+| `terraform apply` | several minutes; VGW and interface endpoints are the slow parts |
+| `warm_vpc.py` | the SSM agent registers a minute or two after the instance boots |
+
+`03/setup-shell` then only reads `/opt/lab/vpc_status.json` and publishes the
+VPC identifiers — normally instant. It re-checks for at most 60s, and only if
+the boot-time warm-up has not reported yet, which means the participant got
+there unusually fast.
+
+The work is the same wall-clock time wherever it runs. What changes is whether
+it overlaps Parts 1 and 2 — half an hour of conversation — or lands in the
+participant's lap while they watch a challenge load. An earlier version waited
+up to three minutes in Part 3 for SSM registration alone.
 
 ## The Part 3 test VM has no internet, and that shapes the probe
 
