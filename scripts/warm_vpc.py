@@ -113,14 +113,30 @@ def main():
           f"(up to {SSM_WAIT_SECONDS}s)...", flush=True)
     online, status = cloud_vpc.ssm_registered(instance, wait=SSM_WAIT_SECONDS)
     if not online:
+        # Print the facts before the verdict. A VM that never registers is the
+        # case where SSM-based probing tells us nothing at all, so this is
+        # exactly where the console block earns its keep — it is read over
+        # ec2:GetConsoleOutput and does not need the agent to be working.
+        print("\n--- test VM diagnosis ---", flush=True)
+        try:
+            print(cloud_vpc.diagnose_test_vm(instance), flush=True)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"   diagnosis failed: {exc}", flush=True)
+        print("-------------------------\n", flush=True)
+
         write_status(
             ready=False, ssm=status, exec="skipped", probe="skipped",
             fatal=True,
             detail=("The test VM never became manageable through SSM. Part 3's "
                     "verification runs commands on it, so the challenge cannot "
-                    "work. Check that `ssm` is in the AWS services list in "
-                    "config.yml, that the three SSM interface endpoints came "
-                    "up, and that the instance profile is attached."),
+                    "work. Check, in this order: that `ssm`, `ssmmessages` AND "
+                    "`ec2messages` are all in the AWS services list in "
+                    "config.yml (all three are required and only the first "
+                    "affects PingStatus); that the instance profile's policy "
+                    "attachment exists; and that the workload subnet is "
+                    "associated with the route table carrying the default "
+                    "route. The console diagnostics above name the failing "
+                    "call directly."),
         )
         return 1
     print(f"   SSM: {status}", flush=True)

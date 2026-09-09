@@ -11,14 +11,20 @@ module is how the check reaches in to do that.
 
 Reaching in is done with SSM Run Command rather than SSH. No key material to
 distribute, no security-group hole to punch for port 22, and the test VM needs
-an SSM agent and an instance profile anyway to be a realistic workload. If
-`ssm` is missing from the `services:` list in config.yml, every probe here
-degrades to "could not reach the test VM" rather than a false failure.
+an SSM agent and an instance profile anyway to be a realistic workload.
 
-The VM reaches SSM over the PUBLIC endpoints, via an internet gateway. It was
-originally in a private subnet with three SSM interface endpoints, which is more
-realistic and cost three debugging cycles without ever working — see the note
-above `aws_internet_gateway` in terraform/main.tf.
+SSM NEEDS THREE IAM SERVICE PREFIXES, and config.yml must list all of them:
+`ssm` (the heartbeat, which is what sets PingStatus to Online), `ssmmessages`
+(the control channel Run Command is delivered over) and `ec2messages`. With only
+`ssm` allowed, every probe in this module reports a VM that is Online and will
+not run anything — which reads as a network fault and is not one. That cost
+three rounds of debugging aimed at the subnet; see the note above
+`aws_internet_gateway` in terraform/main.tf.
+
+The VM reaches SSM over the PUBLIC endpoints, via an internet gateway, and its
+console carries a diagnostic block (`LAB_SSM_DIAG`) written by user_data.
+`diagnose_test_vm()` reads it. That path deliberately does not depend on SSM,
+because the situations worth diagnosing are the ones where SSM is what broke.
 
 Nothing here creates infrastructure. Terraform does that at track setup; this
 module only observes.
@@ -300,7 +306,57 @@ def diagnose_test_vm(instance_id=None):
     except Exception as exc:                            # noqa: BLE001
         lines.append(f"  account-wide SSM listing failed: {exc}")
 
+    # The agent's own account of itself, read WITHOUT using SSM.
+    lines.append("")
+    lines.append(console_diagnostics(instance_id))
+
     return "\n".join(lines)
+
+
+def console_diagnostics(instance_id=None):
+    """
+    The `LAB_SSM_DIAG` blocks the VM writes to its serial console at boot.
+
+    This is the only instrument here that does not depend on the thing it is
+    used to diagnose. Every other probe in this module asks SSM whether SSM is
+    working; when the answer is "no" they report a symptom and nothing about the
+    cause, which is how four consecutive theories about the Pending problem each
+    survived a whole track restart before being disproved.
+
+    user_data (terraform/main.tf) writes the agent's unit state and the tail of
+    /var/log/amazon/ssm/amazon-ssm-agent.log to /dev/console at roughly t+60s,
+    t+180s and t+420s. An IAM denial on ssmmessages appears there in full, named.
+
+    Needs only ec2:GetConsoleOutput. Empty for the first minute or so after boot
+    while the buffer fills, which is not an error.
+    """
+    instance_id = instance_id or test_vm_instance_id()
+    if not instance_id:
+        return "console: no instance id"
+
+    try:
+        output = _client("ec2").get_console_output(
+            InstanceId=instance_id, Latest=True
+        ).get("Output", "")
+    except Exception as exc:                            # noqa: BLE001
+        return f"console: could not be read: {exc}"
+
+    if not output:
+        return ("console: empty — normal for the first minute after boot, "
+                "before the serial buffer is flushed")
+
+    # Keep only the newest diagnostic block. The console buffer also holds the
+    # whole kernel boot, which is a lot of text and none of it relevant.
+    blocks = output.split("=== LAB_SSM_DIAG start")
+    if len(blocks) < 2:
+        return ("console: readable, but no LAB_SSM_DIAG block yet — the first "
+                "is written about 60s after boot. If the VM has been up for "
+                "several minutes and there is still none, user_data did not "
+                "run; check the tail of the console for a cloud-init error.")
+
+    newest = blocks[-1].split("=== LAB_SSM_DIAG end")[0]
+    body = "\n".join(f"    {line}" for line in newest.strip().splitlines())
+    return f"  console (newest LAB_SSM_DIAG block):\n{body}"
 
 
 def run_on_test_vm(command, timeout=180, instance_id=None):
@@ -374,11 +430,15 @@ def run_on_test_vm(command, timeout=180, instance_id=None):
     # remedy is different too.
     if status == "Pending":
         detail += (" — the SSM agent accepted the command but never ran it. "
-                   "The instance can register (PingStatus Online) while still "
-                   "being unable to receive Run Command, so 'registered' and "
-                   "'commandable' are different states. Check that the VM has "
-                   "a public IP and a route to the internet gateway: SSM is "
-                   "reached over the public endpoints in this VPC")
+                   "'Registered' and 'commandable' are different states: the "
+                   "heartbeat is ssm:UpdateInstanceInformation, the delivery "
+                   "path is ssmmessages:*, and they can be permitted "
+                   "separately. THE FIRST THING TO CHECK is that `ssmmessages` "
+                   "and `ec2messages` are both in the services list in "
+                   "config.yml — with only `ssm` there, this is exactly the "
+                   "symptom. Then check the public IP and the route to the "
+                   "internet gateway. `diagnose_test_vm()` prints the agent's "
+                   "own log from the console, which names the denied call")
 
     return {"ok": status == "Success" and rc == 0,
             "status": status, "rc": rc,
@@ -395,12 +455,16 @@ def test_vm_can_run_commands(instance_id=None, attempts=2, timeout=150):
     path Part 3 exercises. Conflating them meant a public-DNS quirk failed the
     whole track start.
 
-    RETRIED, because the failure it guards against is a timing one. The SSM
-    agent's control channel can take a little while to establish after the
-    interface endpoints come up, and a single attempt turns "not ready yet"
-    into "will never work". Terraform now boots the VM after the endpoints
+    RETRIED, because the failure it guards against is a timing one. The agent's
+    control channel takes a little while to establish after boot, and a single
+    attempt turns "not ready yet" into "will never work". Terraform now boots
+    the VM only after its route, its subnet association and its IAM policy all
     exist, which should make the first attempt succeed; these retries are what
-    stops a slow agent failing a whole track start anyway.
+    stops a merely slow agent failing a whole track start anyway.
+
+    Note that no number of retries fixes a missing `ssmmessages` permission —
+    that failure is permanent and looks identical from here. run_on_test_vm()
+    says so in its Pending detail, and diagnose_test_vm() can prove it.
     """
     last = "no attempt made"
     for attempt in range(1, attempts + 1):
@@ -413,12 +477,12 @@ def test_vm_can_run_commands(instance_id=None, attempts=2, timeout=150):
             version = [l for l in result["stdout"].splitlines()
                        if l != "LAB_EXEC_OK"]
             if not version:
-                # A hard no: nothing about waiting longer installs python3, and
-                # the subnet has no internet to fetch it.
+                # A hard no: nothing about waiting longer installs python3.
                 return False, ("python3 is not available on the test VM. The "
-                               "DNS probe needs it, and the subnet has no "
-                               "internet to install it. A different AMI or a "
-                               "NAT gateway would be required.")
+                               "DNS probe needs it. Amazon Linux 2023 ships "
+                               "it, so this almost certainly means the AMI "
+                               "filter in terraform/main.tf matched something "
+                               "else — a minimal variant, most likely.")
             return True, f"commands run; python3 {version[0]}"
 
         last = result["detail"]
@@ -458,8 +522,9 @@ def resolve_from_test_vm(fqdn, resolver=None, timeout=120, ssm_wait=0):
         return [], (f"The test VM ({instance_id}) is not reachable through SSM "
                     f"— ping status: {status}. Nothing can run on it, so this "
                     f"is an environment fault rather than a DNS problem. The "
-                    f"usual causes are the SSM interface endpoints not being "
-                    f"up, or the instance profile missing.")
+                    f"usual causes are the `ssmmessages` / `ec2messages` "
+                    f"services missing from config.yml, the instance profile "
+                    f"missing its policy, or no route to the internet gateway.")
 
     payload = base64.b64encode(_DNS_PROBE.encode()).decode()
     command = (f"echo {payload} | base64 -d > /tmp/dnsprobe.py && "
