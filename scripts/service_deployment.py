@@ -86,6 +86,125 @@ def pick_size(client, wanted=None):
     return names[0]
 
 
+# Where the endpoint runs, as NIOS-X as a Service names it.
+#
+# NOT an AWS region, which is the assumption that failed: a live sandbox
+# answered `service_location: us-east-1` with
+#
+#     HTTP 400: HTTP interceptor error: Service location us-east-1 not supported
+#
+# These are Infoblox points of presence with their own naming. The valid set is
+# not documented anywhere this lab can reach, so discover it — and if discovery
+# fails, say what was tried rather than guessing a fourth spelling.
+SERVICE_LOCATION_PATHS = (
+    "/api/universalinfra/v1/servicelocations",
+    "/api/universalinfra/v1/supportedlocations",
+    "/api/universalinfra/v1/supportedserviceLocations",
+    "/api/universalinfra/v1/serviceregions",
+)
+
+
+def discover_service_locations(client):
+    """
+    Every service location this tenant will accept, and where the list came
+    from. Returns (values, source_path) — empty when nothing answered.
+
+    Tries several paths because only `/supportedsizes` is confirmed, and the
+    naming of its siblings is a guess. Whichever one answers is recorded in the
+    log so the next person can hard-code it and delete the rest.
+    """
+    for path in SERVICE_LOCATION_PATHS:
+        try:
+            rows = client.list_results(path)
+        except CspError:
+            continue
+        except Exception:                               # noqa: BLE001
+            continue
+
+        values = []
+        for row in rows or []:
+            if isinstance(row, str):
+                values.append(row)
+            elif isinstance(row, dict):
+                # Field name unknown; take the first plausible one.
+                for field in ("name", "location", "service_location", "id"):
+                    if row.get(field):
+                        values.append(str(row[field]))
+                        break
+        if values:
+            return values, path
+
+    # Nothing enumerates them. An endpoint that already exists in this tenant
+    # is weaker evidence but it is *evidence* — whatever value it holds was
+    # accepted by this same interceptor, which is more than any guess can say.
+    try:
+        existing = client.list_results(cfg.path("endpoints"))
+        in_use = [row.get("service_location") for row in existing or []
+                  if row.get("service_location")]
+        if in_use:
+            return sorted(set(in_use)), "service_location of existing endpoints"
+    except (CspError, Exception):                       # noqa: BLE001
+        pass
+
+    return [], None
+
+
+def location_variants(region):
+    """
+    Plausible spellings of one AWS region as a service location.
+
+    Frank about what this is: guessing. It exists because the valid set is not
+    enumerated anywhere this lab can reach, and a bounded list of five failed
+    POSTs that finds the right answer beats a track that cannot build its
+    endpoint. Each attempt is logged, so the first successful run tells the
+    next maintainer the real answer and this list can be deleted.
+    """
+    compact = region.replace("-", "")
+    return [
+        region,
+        f"aws-{region}",
+        f"AWS-{region.upper()}",
+        compact,
+        region.replace("-", "_").upper(),
+    ]
+
+
+def pick_service_location(client, wanted=None):
+    """
+    The service location to put the endpoint in.
+
+    Prefers an exact match on the AWS region, then a case-insensitive one, then
+    anything whose name contains the region — a PoP named `aws-us-east-1` or
+    `US-East-1 (Ashburn)` should all match `us-east-1`. Falls back to the first
+    offered location rather than failing: an endpoint in the wrong PoP is
+    something a participant can see and reason about; no endpoint at all is not.
+    """
+    wanted = wanted or cfg.VPC_REGION
+    values, source = discover_service_locations(client)
+
+    if not values:
+        info(f"no service-location list available (tried "
+             f"{len(SERVICE_LOCATION_PATHS)} paths); using {wanted!r} unchecked")
+        return wanted
+
+    info(f"service locations offered by {source}: {values}")
+
+    if wanted in values:
+        return wanted
+    for value in values:
+        if value.lower() == wanted.lower():
+            return value
+    for value in values:
+        if wanted.lower() in value.lower() or value.lower() in wanted.lower():
+            info(f"service location {wanted!r} not offered exactly; "
+                 f"using the closest match {value!r}")
+            return value
+
+    info(f"service location {wanted!r} not offered and nothing resembles it; "
+         f"using {values[0]!r}")
+    return values[0]
+
+
 def pick_location(client):
     """
     A Location for the Access Location to sit at.
@@ -118,11 +237,12 @@ def pick_location(client):
 #
 #     HTTP 400: HTTP interceptor error: capability 'DNS' is not allowed
 #
-# which is ambiguous between two very different causes: the enum wants a
-# different string, or the account is not entitled to DNS as a universal
-# service capability at all. Cheaper to try the plausible spellings than to
-# guess which, and the fallback below distinguishes them either way.
-CAPABILITY_TYPES = ("DNS", "dns", "DNS_SERVER")
+# and accepted lowercase `dns` on the next run. So it was the enum, not an
+# entitlement — but the fallback below stays, because the two causes are
+# indistinguishable from the error text and the other one is real elsewhere.
+# Confirmed spelling first; the rest cost one round trip each only if it
+# changes.
+CAPABILITY_TYPES = ("dns", "DNS", "DNS_SERVER")
 
 
 def _capability_refused(exc):
@@ -135,38 +255,35 @@ def _capability_refused(exc):
     return exc.status == 400 and "capability" in (exc.body or "").lower()
 
 
-def _report_allowed_capabilities(client, body):
+def _report_allowed(client, path, body, probe, label):
     """
     Ask the interceptor what it WOULD accept, by sending something it cannot.
 
-    Whoever has to get this sandbox entitled for DNS needs to know what it is
-    entitled for now, and "capability 'DNS' is not allowed" does not say. So
-    send a capability type that certainly does not exist: the request is
-    guaranteed to fail, which means it creates nothing, and validation errors
-    of this kind often enumerate the permitted values in the rejection.
+    "capability 'DNS' is not allowed" and "Service location us-east-1 not
+    supported" both say what is wrong and not what is right, which leaves
+    whoever has to fix it guessing. So send a value that certainly does not
+    exist: the request is guaranteed to fail, so it creates nothing, and
+    validation errors of this kind often enumerate the permitted values.
 
     Purely diagnostic. Any outcome is fine; nothing downstream depends on it.
     """
-    probe = "ZZZ_NOT_A_CAPABILITY"
     try:
-        client.post(cfg.path("universal_service"),
-                    json_body=dict(body, capabilities=[{"type": probe}]))
+        client.post(path, json_body=body)
     except CspError as exc:
         detail = (exc.body or "").strip()
-        # Only worth printing if it says something the earlier refusals did
-        # not — otherwise it is the same sentence with a different noun.
+        # Only worth printing if it says something the real refusal did not —
+        # otherwise it is the same sentence with a different noun in it.
         if detail and probe not in detail:
-            print(f"    the API's response to an invalid capability, which may "
-                  f"name the allowed set:\n      {detail[:300]}", flush=True)
+            print(f"    the API's response to an invalid {label[:-1]}, which "
+                  f"may name the allowed set:\n      {detail[:300]}", flush=True)
         return
     except Exception:                                   # noqa: BLE001
         return
 
-    # It accepted a capability that cannot exist. Nothing to learn, and now
-    # there is a stray object — say so rather than leaving it silently.
-    print("    ⚠️  the API accepted a nonsense capability type; a stray "
-          f"'{cfg.SERVICE_DEPLOYMENT_NAME}' service may need removing.",
-          flush=True)
+    # It accepted a value that cannot be valid. Nothing to learn, and now there
+    # is a stray object — say so rather than leaving it silently.
+    print(f"    ⚠️  the API accepted a nonsense {label[:-1]}; a stray object "
+          f"at {path} may need removing.", flush=True)
 
 
 def ensure_universal_service(client, profile_id=None):
@@ -222,7 +339,9 @@ def ensure_universal_service(client, profile_id=None):
         print(f"      {line}", flush=True)
     print("    That is an entitlement on the account, not a payload this "
           "script can fix.", flush=True)
-    _report_allowed_capabilities(client, body)
+    _report_allowed(client, cfg.path("universal_service"),
+                    dict(body, capabilities=[{"type": "ZZZ_NOT_A_CAPABILITY"}]),
+                    "ZZZ_NOT_A_CAPABILITY", "capabilities")
 
     created = client.post(cfg.path("universal_service"), json_body=body)
     print(f"⚠️  created {cfg.SERVICE_DEPLOYMENT_NAME} WITHOUT a DNS "
@@ -244,10 +363,11 @@ def ensure_endpoint(client, service_id, size=None):
         info(f"endpoint {cfg.ENDPOINT_NAME} already present")
         return existing
 
-    created = client.post(cfg.path("endpoints"), json_body={
+    location = pick_service_location(client)
+    body = {
         "name": cfg.ENDPOINT_NAME,
         "universal_service_id": service_id,
-        "service_location": cfg.VPC_REGION,
+        "service_location": location,
         "service_ip": cfg.SERVICE_IP,
         "size": size or cfg.ENDPOINT_SIZE,
         # Required, and legitimately empty: BGP peers are configured on the
@@ -255,9 +375,40 @@ def ensure_endpoint(client, service_id, size=None):
         "neighbour_ips": [],
         "description": "Serves svc.techcorp.internal to the TechCorp AI VPC",
         "tags": LAB_TAGS,
-    })
+    }
+
+    # Try the chosen value, then spellings of it, then give up with the
+    # evidence. Only location refusals are retried — any other 400 means the
+    # payload is wrong in a way a different region string will not fix, and
+    # five identical failures would bury that in the log.
+    attempts, last = [], None
+    for candidate in [location] + [v for v in location_variants(cfg.VPC_REGION)
+                                   if v != location]:
+        try:
+            created = client.post(cfg.path("endpoints"),
+                                  json_body=dict(body,
+                                                 service_location=candidate))
+        except CspError as exc:
+            if "service location" not in (exc.body or "").lower():
+                raise
+            attempts.append(candidate)
+            last = exc
+            continue
+
+        if attempts:
+            ok(f"service location {candidate!r} accepted after "
+               f"{len(attempts)} refused: {attempts}")
+        location = candidate
+        break
+    else:
+        print(f"⚠️  every service location was refused: {attempts}", flush=True)
+        _report_allowed(client, cfg.path("endpoints"),
+                        dict(body, service_location="ZZZ_NOT_A_LOCATION"),
+                        "ZZZ_NOT_A_LOCATION", "service locations")
+        raise last
+
     ok(f"created endpoint {cfg.ENDPOINT_NAME} at {cfg.SERVICE_IP} "
-       f"({cfg.VPC_REGION})")
+       f"(service location {location})")
     return created.get("result", created)
 
 
@@ -336,7 +487,41 @@ def build(client, profile_id=None):
     service = ensure_universal_service(client, profile_id=profile_id)
     service_id = service["id"]
 
-    endpoint = ensure_endpoint(client, service_id, size=size)
+    # Whether the service can actually serve DNS, as opposed to merely
+    # existing. Part 3's check reads this to tell "the track failed to build
+    # it" apart from "the tenant is not entitled to it" — two different
+    # messages for the participant, and only one of them is worth their time.
+    capabilities = service.get("capabilities") or []
+    result = {
+        "universal_service_id": service_id,
+        "universal_service_name": cfg.SERVICE_DEPLOYMENT_NAME,
+        "service_ip": cfg.SERVICE_IP,
+        "endpoint_size": size,
+        "has_dns_capability": any(
+            "dns" in str(cap.get("type", "")).lower() for cap in capabilities
+        ),
+    }
+
+    # The service is recorded BEFORE the endpoint is attempted, and the
+    # endpoint's failure does not discard it.
+    #
+    # An earlier version let this exception propagate, and a live run showed
+    # why that is wrong: the service was created, the endpoint was refused, and
+    # the caller's `except` threw away every id including the service's — so
+    # seed_ids.json claimed nothing existed while the tenant held a real
+    # object. Part 3 then told the participant the service was missing while
+    # the Portal showed it plainly.
+    try:
+        endpoint = ensure_endpoint(client, service_id, size=size)
+    except CspError as exc:
+        print(f"⚠️  the service exists but its endpoint was refused: {exc}",
+              flush=True)
+        print("    Part 3 steps 1 to 3 still work against the service; step 4 "
+              "cannot resolve without an endpoint.", flush=True)
+        return result
+
+    result["endpoint_id"] = endpoint["id"]
+    result["endpoint_name"] = cfg.ENDPOINT_NAME
 
     linked = associations(client, service_id)
     if linked:
@@ -349,20 +534,4 @@ def build(client, profile_id=None):
     info("access location NOT created: it needs the AWS VPN's outside "
          "addresses, which Part 3 produces")
 
-    # Whether the service can actually serve DNS, as opposed to merely
-    # existing. Part 3's check reads this to tell "the track failed to build
-    # it" apart from "the tenant is not entitled to it" — two different
-    # messages for the participant, and only one of them is worth their time.
-    capabilities = service.get("capabilities") or []
-    has_dns = any("dns" in str(cap.get("type", "")).lower()
-                  for cap in capabilities)
-
-    return {
-        "universal_service_id": service_id,
-        "universal_service_name": cfg.SERVICE_DEPLOYMENT_NAME,
-        "endpoint_id": endpoint["id"],
-        "endpoint_name": cfg.ENDPOINT_NAME,
-        "service_ip": cfg.SERVICE_IP,
-        "endpoint_size": size,
-        "has_dns_capability": has_dns,
-    }
+    return result
