@@ -108,6 +108,7 @@ python3 teardown_lab.py --reset                 # teardown, then re-seed clean
 | `BEDROCK_REGION` | `us-east-1` | Bedrock **and** VPC region. Must be in `config.yml` and have model access granted. |
 | `AGENT_KEY_FILE` | `/opt/lab/mcp_key` | The key baked into the MCP registration. Rewrite it, then re-run `setup_claude_code.sh --keys-only`. |
 | `AWS_MCP_ENABLED` | `1` | Set `0` to run Infoblox-only, e.g. when debugging Parts 1/2/4. |
+| `AWS_MCP_ARGS` | `awslabs.aws-api-mcp-server@latest` | Deprecated upstream — see below. Overridable without a code change. |
 | `LAB_DC_RESOLVER` | *unset* | Resolver the Part 2 `dig` probe queries. **TODO-22** — the probe is skipped while unset. |
 
 ### Topology — change these and you must change the matching `assignment.md` prose
@@ -459,6 +460,25 @@ The lab works around it with a diagnose → apply → verify loop; the assistant
 drafts the change, the participant applies it in the Portal, and the assistant
 reads it back. `setup_claude_code.sh` writes the instruction that produces that
 behaviour into the project CLAUDE.md.
+
+## Known follow-up: the AWS MCP server is deprecated
+
+`awslabs.aws-api-mcp-server` prints a deprecation notice. The successor is a
+proxy to a managed remote server:
+
+```
+uvx mcp-proxy-for-aws@1.6.3 --metadata AWS_REGION=us-east-1
+```
+
+It is a different architecture — a proxy to `https://aws-mcp.us-east-1.api.aws/mcp`
+rather than a local server — and the whole `env` block goes away, including
+`READ_OPERATIONS_ONLY` and `AWS_API_MCP_WORKING_DIR`, because the managed server
+uses IAM and sandboxed execution instead.
+
+**Not switched, deliberately.** Deprecated is not broken, the current server is
+the one part of Part 3 that demonstrably works, and a remote managed endpoint
+introduces a new dependency this lab has not tested. Change `AWS_MCP_ARGS` when
+there is time to verify it end to end rather than as a drive-by.
 
 ## Design notes
 
