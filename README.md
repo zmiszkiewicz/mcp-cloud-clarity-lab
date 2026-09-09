@@ -288,25 +288,34 @@ key: user administration is not exposed through the MCP Server at all.
 `provision_mcp_keys.py`, `revoke_mcp_keys.py` and `check_c4` all still support
 it.
 
-## Part 3 does its waiting at boot, not in Part 3
+## Part 3's VPC is a track-start gate
 
-Nothing slow happens when the participant opens Part 3. `track_scripts/setup-shell`
-backgrounds the whole thing at track start:
+**The track does not start unless the Part 3 VPC is usable.** Nothing later can
+repair it: Part 3's load-bearing check runs a DNS query on the test VM, so a
+lab whose VM never came up cannot be completed. Discovering that at Part 3
+costs the participant the half hour behind them; discovering it at boot costs
+them a restart.
 
-| At boot, backgrounded | Why there |
-|---|---|
-| `terraform apply` | several minutes; VGW and interface endpoints are the slow parts |
-| `warm_vpc.py` | the SSM agent registers a minute or two after the instance boots |
+Two things run at track start, concurrently:
+
+| Step | What | Concurrent with |
+|---|---|---|
+| 7 | `terraform apply`, then `warm_vpc.py`, backgrounded | the broker call below |
+| 8 | `allocation_subtenant.py` and its propagation wait | the build above |
+| 9 | block on step 7; **exit non-zero if it failed** | — |
+
+Starting the build before the broker call is what keeps the gate cheap: the two
+slow things overlap instead of queueing, so step 9 is usually short.
+
+`warm_vpc.py` is the part worth understanding. Creating the test VM is not the
+same as being able to run a command on it — the SSM agent registers a minute or
+two after boot, and until it does every probe sits Pending. So `terraform.done`
+means *fully ready*, not "terraform finished", and a marker meaning less than
+that would let a broken lab through.
 
 `03/setup-shell` then only reads `/opt/lab/vpc_status.json` and publishes the
-VPC identifiers — normally instant. It re-checks for at most 60s, and only if
-the boot-time warm-up has not reported yet, which means the participant got
-there unusually fast.
-
-The work is the same wall-clock time wherever it runs. What changes is whether
-it overlaps Parts 1 and 2 — half an hour of conversation — or lands in the
-participant's lap while they watch a challenge load. An earlier version waited
-up to three minutes in Part 3 for SSM registration alone.
+VPC identifiers. It is fatal if the status says not-ready, but by construction
+that should never fire — it catches a VM that broke *between* boot and Part 3.
 
 ## The Part 3 test VM has no internet, and that shapes the probe
 

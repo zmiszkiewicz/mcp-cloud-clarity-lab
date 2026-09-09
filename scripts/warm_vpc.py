@@ -26,9 +26,11 @@ WHAT IT WRITES
 `03/setup-shell` reports that rather than re-deriving it. Absent means this is
 still running, which the challenge handles without blocking.
 
-Never exits non-zero for a readiness problem. The VPC existing is what Part 3
-requires; a warm SSM agent is what makes it pleasant. Failing the build over
-the second would throw away the first.
+EXITS NON-ZERO IF THE VM IS NOT USABLE. A VPC whose test VM cannot be reached
+is not a lab that can complete Part 3 — the load-bearing check runs `dig` on
+that VM. Better to fail the track at boot, where the participant loses nothing
+but a restart, than thirty minutes in, where they lose the work they have done.
+track_scripts/setup-shell blocks on this and fails the track start.
 """
 
 import json
@@ -42,9 +44,9 @@ import cloud_vpc  # noqa: E402
 
 STATUS_FILE = os.environ.get("LAB_VPC_STATUS", "/opt/lab/vpc_status.json")
 
-# Generous: this is background work nobody is waiting on, and an SSM agent that
-# is going to register has done so long before this elapses.
-SSM_WAIT_SECONDS = int(os.environ.get("LAB_SSM_WAIT", "600"))
+# The track start blocks on this, so it cannot be open-ended. An SSM agent that
+# is going to register does so in a minute or two; five is generous.
+SSM_WAIT_SECONDS = int(os.environ.get("LAB_SSM_WAIT", "300"))
 
 
 def write_status(**fields):
@@ -59,7 +61,7 @@ def main():
     if not instance:
         write_status(ready=False, ssm="no test VM found", probe="skipped",
                      detail="terraform did not produce a test VM instance id")
-        return 0
+        return 1
 
     print(f"waiting for SSM to adopt {instance} "
           f"(up to {SSM_WAIT_SECONDS}s)...", flush=True)
@@ -74,7 +76,7 @@ def main():
                     "that the three SSM interface endpoints came up, and that "
                     "the instance profile is attached."),
         )
-        return 0
+        return 1
 
     # One warm-up query against a public name. It proves the whole path — SSM
     # transport, python3 on the VM, the DNS client itself — without depending on
@@ -83,10 +85,10 @@ def main():
     if answers:
         write_status(ready=True, ssm=status, probe="resolved",
                      detail=f"amazon.com -> {answers[0]} from inside the VPC")
-    else:
-        write_status(ready=False, ssm=status, probe="failed", detail=detail)
+        return 0
 
-    return 0
+    write_status(ready=False, ssm=status, probe="failed", detail=detail)
+    return 1
 
 
 if __name__ == "__main__":
