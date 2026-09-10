@@ -45,6 +45,8 @@ Order at track start:
 
 import argparse
 import contextlib
+import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -52,6 +54,19 @@ from datetime import datetime, timezone
 import lab_config as cfg
 from csp_client import (CspClient, CspError, info, object_url, ok,
                         read_state, write_state)
+
+
+# WHY ITS OWN FILE AND NOT seed_ids.json
+# --------------------------------------
+# seed_lab.py writes seed_ids.json with a whole-file json.dump, and it runs in
+# 01/setup-shell while this script is still registering a host in the
+# background. A merge here would be read-modify-write against a file another
+# process overwrites wholesale, so whichever finished second would silently
+# erase the other's keys. Part 3 reading "no DNS service" from a tenant that
+# had one is precisely that race.
+#
+# Separate files have no such interleaving. 03/setup-shell reads both.
+IDS_FILE = "niosx_ids.json"
 
 
 # Host activation has moved between releases, so the tenant is asked rather
@@ -550,6 +565,21 @@ def build(client, timeout=900, service_timeout=300):
     }
 
 
+def save_ids(ids):
+    """
+    Record what was built, next to the other state files.
+
+    build() used to return this dict to main(), which printed a success line
+    and dropped it. Nothing downstream could then tell a registered host from
+    one that never existed, so 03/setup-shell fell back to "no DNS service" on
+    a tenant that had one. Writing it is the whole point of computing it.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), IDS_FILE)
+    with open(path, "w") as handle:
+        json.dump(ids, handle, indent=2)
+    info(f"host and service ids written to {path}")
+
+
 def show_status(client):
     """Print everything this script manages."""
     print("=" * 62)
@@ -611,6 +641,7 @@ def main():
         return 0
 
     ids = build(client, timeout=args.timeout)
+    save_ids(ids)
     show_status(client)
     print(f"\n✅ NIOS-X host ready at {ids['niosx_host_ip']} serving DNS")
     return 0
