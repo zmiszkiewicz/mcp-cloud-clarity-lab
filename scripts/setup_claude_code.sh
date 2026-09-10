@@ -45,7 +45,56 @@ MCP_URL="${MCP_SERVER_URL:-https://csp.infoblox.com/mcp}"
 # eu-central-1. Reading AWS_DEFAULT_REGION here would point Bedrock at a region
 # with no model access and fail every prompt.
 REGION="${BEDROCK_REGION:-us-east-1}"
-MODEL="${ANTHROPIC_MODEL:-us.anthropic.claude-sonnet-4-6}"
+# DISCOVERED, not hardcoded — and the region can change as a result.
+#
+# A cross-region inference profile is geography-scoped: `us.anthropic.…` only
+# resolves in a US region and `eu.anthropic.…` only in an EU one. Pinning a
+# `us.` id and then moving the lab to eu-central-1 produced
+#
+#     400 The provided model identifier is invalid.
+#
+# on every prompt, which names neither the region nor the geography and reads
+# like the model was withdrawn. pick_bedrock_model.py asks Bedrock what this
+# account can actually invoke in this region, prefixes correctly, and falls
+# back to another region if there is nothing here — so the answer is right
+# wherever the lab runs.
+#
+# ANTHROPIC_MODEL set in the environment still wins, as the manual override.
+if [ -n "${ANTHROPIC_MODEL:-}" ]; then
+  MODEL="${ANTHROPIC_MODEL}"
+  echo "   model pinned by ANTHROPIC_MODEL: ${MODEL}"
+else
+  # ONE invocation. stdout is "<model id> <region>", stderr is the reasoning —
+  # which is worth keeping, so it goes to a file and then into this log rather
+  # than being thrown away or, worse, earning a second call to Bedrock.
+  PICK_ERR="$(mktemp)"
+  PICK_OUT="$(BEDROCK_REGION="${REGION}" \
+    python3 "${LAB_DIR}/scripts/pick_bedrock_model.py" 2>"${PICK_ERR}" || true)"
+  [ -s "${PICK_ERR}" ] && cat "${PICK_ERR}"
+  rm -f "${PICK_ERR}"
+
+  if [ -n "${PICK_OUT}" ]; then
+    MODEL="${PICK_OUT%% *}"
+    PICKED_REGION="${PICK_OUT##* }"
+    # The picker may move Bedrock to another region when this one has no
+    # model. Honour that, or the id and the endpoint disagree and every call
+    # fails with the same unhelpful 400 this was meant to fix.
+    if [ -n "${PICKED_REGION}" ] && [ "${PICKED_REGION}" != "${REGION}" ]; then
+      echo "   Bedrock moves to ${PICKED_REGION}: no usable model in ${REGION}"
+      REGION="${PICKED_REGION}"
+    fi
+  else
+    # Discovery failed outright — boto3 missing, no credentials yet. Derive the
+    # prefix from the region rather than defaulting to a `us.` id that is
+    # guaranteed wrong outside the US.
+    case "${REGION}" in
+      eu-*) MODEL="eu.anthropic.claude-sonnet-4-6" ;;
+      ap-*) MODEL="apac.anthropic.claude-sonnet-4-6" ;;
+      *)    MODEL="us.anthropic.claude-sonnet-4-6" ;;
+    esac
+    echo "⚠️  could not query Bedrock; using ${MODEL} unverified"
+  fi
+fi
 # Where the lab's VPC actually is, which is a different region from Bedrock's.
 # The AWS MCP server acts on that VPC, so pointing it at REGION would have it
 # looking for the VPC in the region where the models live and finding nothing.

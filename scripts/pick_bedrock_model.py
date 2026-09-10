@@ -35,16 +35,68 @@ import re
 import sys
 
 
-# What we want, unless the account cannot invoke it. The `us.` prefix is the
-# cross-region inference profile — Claude Code needs a profile id here, not a
-# bare `anthropic.…` model id, which fails with an on-demand-throughput error.
+# THE PROFILE PREFIX MUST MATCH THE REGION.
+#
+# A cross-region inference profile is geography-scoped, and its id carries that
+# geography as a prefix: `us.anthropic.…` only resolves in a US region,
+# `eu.anthropic.…` only in an EU one. Passing the wrong one produces
+#
+#     400 The provided model identifier is invalid.
+#
+# which says nothing about geographies and reads like the model does not exist.
+# That is exactly what happened when the lab VPC moved to eu-central-1 while
+# the model stayed pinned to a `us.` profile.
+GEO_PREFIXES = (
+    ("us-",   "us."),
+    ("eu-",   "eu."),
+    ("ap-",   "apac."),
+    ("ca-",   "ca."),
+    ("sa-",   "sa."),
+)
+
+
+def geo_prefix(region):
+    """The inference-profile prefix for a region, or '' if none is known."""
+    for start, prefix in GEO_PREFIXES:
+        if region.startswith(start):
+            return prefix
+    return ""
+
+
+# Bedrock's region, which is NOT necessarily the lab VPC's — see
+# track_scripts/setup-shell. BEDROCK_REGION wins; AWS_DEFAULT_REGION is the
+# fallback for standalone runs.
+REGION = os.environ.get("BEDROCK_REGION") or \
+    os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+# Where to go if this region has no invokable Anthropic model at all. Bedrock's
+# region is independent of everything else the lab does, so falling back costs
+# nothing but a little latency — and an assistant that works in the wrong
+# region beats one that does not work in the right one.
+FALLBACK_REGION = os.environ.get("BEDROCK_FALLBACK_REGION", "us-east-1")
+
+# The model family and version we want, WITHOUT a geography prefix. The prefix
+# is added per-region so the same preference works anywhere.
 #
 # Pinned rather than left to discovery because Claude Code's own default on
-# Bedrock is Opus 5 for the primary model and Sonnet 4.5 for the `sonnet` alias.
-# Unpinned, this lab would silently run a different model at a higher rate.
-PREFERRED_MODEL_ID = os.environ.get(
-    "BEDROCK_PREFERRED_MODEL_ID", "us.anthropic.claude-sonnet-4-6"
+# Bedrock is Opus 5 for the primary model and Sonnet 4.5 for the `sonnet`
+# alias. Unpinned, this lab would silently run a different model at a higher
+# rate — which is also how a run ended up on `eu.anthropic.claude-sonnet-5`,
+# an id that does not exist.
+PREFERRED_MODEL_SUFFIX = os.environ.get(
+    "BEDROCK_PREFERRED_MODEL", "anthropic.claude-sonnet-4-6"
 )
+
+
+def preferred_for(region):
+    """The preferred model id, prefixed for this region's geography."""
+    explicit = os.environ.get("BEDROCK_PREFERRED_MODEL_ID")
+    if explicit:
+        return explicit
+    return f"{geo_prefix(region)}{PREFERRED_MODEL_SUFFIX}"
+
+
+PREFERRED_MODEL_ID = preferred_for(REGION)
 
 # Family to fall back to if the preferred id is not invokable here.
 DEFAULT_PREFERENCE = os.environ.get("BEDROCK_MODEL_PREFERENCE", "sonnet")
@@ -54,12 +106,10 @@ FALLBACK_MODEL_ID = os.environ.get(
     "BEDROCK_FALLBACK_MODEL_ID", PREFERRED_MODEL_ID
 )
 
-REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
-
-def _client(service):
+def _client(service, region=None):
     import boto3
-    return boto3.client(service, region_name=REGION)
+    return boto3.client(service, region_name=region or REGION)
 
 
 def _version_key(model_id):
@@ -90,13 +140,13 @@ def _version_key(model_id):
     return (major, minor, int(date.group(1)) if date else 0, model_id)
 
 
-def available_models():
+def available_models(region=None):
     """
     Every Anthropic text model this account can invoke in this region, as
     (invoke_id, summary) — where invoke_id is already the inference profile id
     when the model requires one.
     """
-    bedrock = _client("bedrock")
+    bedrock = _client("bedrock", region)
 
     try:
         summaries = bedrock.list_foundation_models(
@@ -139,43 +189,73 @@ def available_models():
     return usable
 
 
-def choose(preference=None):
+def _choose_in(region, preference=None):
     """
-    The model id to pin, and a one-line explanation.
+    The best model id in ONE region, or (None, why-not).
 
-    Verify-then-fall-back, rather than pure discovery: we know which model this
-    lab wants, so the job is confirming the account can invoke it and choosing
-    sensibly when it cannot.
+    Verify-then-fall-back rather than pure discovery: we know which model this
+    lab wants, so the job is confirming the account can invoke it here and
+    choosing sensibly when it cannot.
     """
-    explicit = os.environ.get("BEDROCK_MODEL_ID")
-    if explicit:
-        return explicit, "BEDROCK_MODEL_ID is set explicitly"
+    wanted = preferred_for(region)
 
     try:
-        usable = available_models()
+        usable = available_models(region)
     except Exception as exc:                            # noqa: BLE001
-        return FALLBACK_MODEL_ID, f"could not query Bedrock ({exc}); using the pin unverified"
+        return None, f"could not query Bedrock in {region} ({exc})"
 
     if not usable:
-        return FALLBACK_MODEL_ID, "no invokable Anthropic models found; using the pin unverified"
+        return None, f"no invokable Anthropic models in {region}"
 
     ids = [invoke_id for invoke_id, _ in usable]
 
-    if PREFERRED_MODEL_ID in ids:
-        return PREFERRED_MODEL_ID, f"preferred model is invokable in {REGION}"
+    if wanted in ids:
+        return wanted, f"{wanted} is invokable in {region}"
 
-    preference = [p.strip().lower() for p in
-                  (preference or DEFAULT_PREFERENCE).split(",") if p.strip()]
-    for family in preference:
+    families = [p.strip().lower() for p in
+                (preference or DEFAULT_PREFERENCE).split(",") if p.strip()]
+    for family in families:
         matches = [i for i in ids if family in i.lower()]
         if matches:
             best = sorted(matches, key=_version_key, reverse=True)[0]
-            return best, (f"{PREFERRED_MODEL_ID} is not invokable here; using "
-                          f"the newest '{family}' instead")
+            return best, (f"{wanted} is not invokable in {region}; using the "
+                          f"newest '{family}' there instead: {best}")
 
     best = sorted(ids, key=_version_key, reverse=True)[0]
-    return best, (f"neither {PREFERRED_MODEL_ID} nor {preference} is available; "
-                  f"using the newest Anthropic model in the account")
+    return best, (f"no {families} model in {region}; using the newest "
+                  f"Anthropic model available there: {best}")
+
+
+def choose(preference=None):
+    """
+    The model id to pin, the region to invoke it in, and why.
+
+    Tries the configured Bedrock region first, then FALLBACK_REGION. The
+    fallback exists because Bedrock's region is independent of everything else
+    the lab does — the model calls leave from the lab container and care
+    nothing about where the VPC is — so an account with no EU model access
+    should quietly use a US one rather than leave the participant with an
+    assistant that returns 400 on every prompt.
+    """
+    explicit = os.environ.get("BEDROCK_MODEL_ID")
+    if explicit:
+        return explicit, REGION, "BEDROCK_MODEL_ID is set explicitly"
+
+    model, why = _choose_in(REGION, preference)
+    if model:
+        return model, REGION, why
+
+    if FALLBACK_REGION and FALLBACK_REGION != REGION:
+        print(f"⚠️  {why}; trying {FALLBACK_REGION}", file=sys.stderr)
+        model, fallback_why = _choose_in(FALLBACK_REGION, preference)
+        if model:
+            return model, FALLBACK_REGION, (
+                f"{why}, so Bedrock will run in {FALLBACK_REGION} instead "
+                f"— {fallback_why}"
+            )
+        why = f"{why}; and {fallback_why}"
+
+    return FALLBACK_MODEL_ID, REGION, f"{why}. Using the pin unverified."
 
 
 def main():
@@ -199,9 +279,10 @@ def main():
             print(f"  {invoke_id}{via}")
         return 0
 
-    model_id, why = choose()
-    # stdout is the id and nothing else — setup-shell captures it directly.
-    print(model_id)
+    model_id, region, why = choose()
+    # stdout is "<model id> <region>" and nothing else, so a caller can read
+    # both with `read`. Everything explanatory goes to stderr.
+    print(f"{model_id} {region}")
     print(f"   {why}", file=sys.stderr)
     return 0
 

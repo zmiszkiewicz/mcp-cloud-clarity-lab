@@ -113,16 +113,41 @@ TERRAFORM_DIR = os.path.join(LAB_DIR, "terraform")
 # without teaching a participant anything. Claude Code is the vendor-documented
 # path for this server and maintains the client itself.
 
-# The model, as a cross-region inference profile id. Claude Code needs a profile
-# id here; a bare `anthropic.…` fails with an on-demand-throughput error.
+# The model, as a cross-region inference profile id. Claude Code needs a
+# profile id here; a bare `anthropic.…` fails with an on-demand-throughput
+# error that never mentions inference profiles.
 #
-# Pinned rather than defaulted: Claude Code on Bedrock defaults its primary
-# model to Opus 5 and its `sonnet` alias to Sonnet 4.5, so an unpinned lab runs
-# a different model than intended AND is billed at the Opus rate.
-# pick_bedrock_model.py confirms the account can invoke this and falls back
-# sensibly if not.
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID",
-                                  "us.anthropic.claude-sonnet-4-6")
+# THE GEOGRAPHY PREFIX MUST MATCH THE REGION. `us.anthropic.…` only resolves
+# from a US endpoint, `eu.anthropic.…` only from an EU one. A hardcoded `us.`
+# id here is what turned every prompt into
+#
+#     400 The provided model identifier is invalid.
+#
+# once the lab VPC — and with it Bedrock — moved to eu-central-1.
+#
+# Pinned rather than left to Claude Code's own default, which on Bedrock is
+# Opus 5 for the primary model and Sonnet 4.5 for the `sonnet` alias: unpinned,
+# this lab runs a different model than intended AND is billed at the Opus rate.
+# pick_bedrock_model.py verifies the account can invoke it, corrects the prefix
+# for whatever region Bedrock is in, and falls back sensibly if not.
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION",
+                                os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+BEDROCK_MODEL_FAMILY = os.environ.get("BEDROCK_PREFERRED_MODEL",
+                                      "anthropic.claude-sonnet-4-6")
+
+
+def _geo_prefix(region):
+    """Inference-profile prefix for a region. Kept in step with
+    pick_bedrock_model.GEO_PREFIXES, which is the authority."""
+    for start, prefix in (("us-", "us."), ("eu-", "eu."), ("ap-", "apac."),
+                          ("ca-", "ca."), ("sa-", "sa.")):
+        if region.startswith(start):
+            return prefix
+    return ""
+
+
+BEDROCK_MODEL_ID = os.environ.get(
+    "BEDROCK_MODEL_ID", f"{_geo_prefix(BEDROCK_REGION)}{BEDROCK_MODEL_FAMILY}")
 BEDROCK_MODEL_PREFERENCE = os.environ.get("BEDROCK_MODEL_PREFERENCE", "sonnet")
 AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
