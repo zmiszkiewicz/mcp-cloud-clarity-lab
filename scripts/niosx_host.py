@@ -99,6 +99,35 @@ STATUS_KEYS = ("connection_status", "status", "composite_status", "state",
 
 RUNNING_STATES = ("start", "started", "running", "active", "online", "ready")
 
+# States that mean "not finished onboarding yet", as opposed to broken.
+#
+# A host reports composite_status=pending for a few minutes after it first
+# calls home, while the CSP works out what it is. DNS cannot be enabled during
+# that window: the API answers
+#
+#     Unable to enable DNS due to unsupported host type
+#
+# which reads like the AMI is wrong and is not. app-migration-niosx uses this
+# same AMI and enables `dns` on it successfully — but it does so from a
+# challenge the participant reaches long after boot, and its assignment tells
+# them to confirm "Status: Online" in the Portal first. That instruction is
+# load bearing and this is the automated version of it.
+#
+# A DENYLIST of transient states rather than an allowlist of good ones,
+# deliberately. The success vocabulary of detail_hosts is undocumented and
+# guessing at it is what made an earlier readiness check stall for fifteen
+# minutes on a perfectly healthy host. "Not pending" is a claim the observed
+# data supports; "equals online" is not.
+PENDING_STATES = ("pending", "provisioning", "onboarding", "initializing",
+                  "installing", "starting", "connecting", "unknown")
+
+# The API's way of saying "right service type, wrong moment". Matched on text
+# because there is no code to match on, and treated as retryable rather than
+# as a rejected service_type — which is what made the boot give up after
+# trying three spellings, only one of which was ever wrong.
+HOST_NOT_READY_HINTS = ("unsupported host type", "host is not ready",
+                        "host type", "not yet available")
+
 
 def _bare(value):
     """Trailing segment of a resource URI: infra/pool/X -> X."""
@@ -375,7 +404,57 @@ def find_dns_service(client, pool_id=None):
     return None
 
 
-def enable_dns_service(client, pool_id, name=None):
+def _host_not_ready(exc):
+    """Whether a 400 is the host still onboarding rather than a bad payload."""
+    body = str(getattr(exc, "body", "") or "").lower()
+    return any(hint in body for hint in HOST_NOT_READY_HINTS)
+
+
+def host_is_online(host):
+    """
+    Whether the host has finished onboarding, not merely registered.
+
+    host_is_ready() asks whether a service can be ATTACHED, which needs only a
+    pool. This asks whether a service can be STARTED, which needs the CSP to
+    have finished working out what the host is. The two are minutes apart and
+    conflating them is what produced "unsupported host type" at boot.
+    """
+    if not _pool_id(host):
+        return False
+    for value in host_status(host).values():
+        if str(value).strip().lower() in PENDING_STATES:
+            return False
+    return True
+
+
+def wait_until_online(client, timeout=600, interval=20, ip=None):
+    """
+    Wait for the host to leave its pending state. Best effort.
+
+    Returns the last host record seen. Does NOT raise on timeout: the
+    authoritative test is whether the service can actually be created, and
+    enable_dns_service retries that on its own. This only avoids hammering the
+    API with a request that cannot succeed yet.
+    """
+    deadline = time.time() + timeout
+    host = None
+    while time.time() < deadline:
+        host = find_host(client, ip=ip)
+        if host and host_is_online(host):
+            ok(f"host is online: {describe_host(host)}")
+            return host
+        remaining = int(deadline - time.time())
+        info(f"⏳ host has not finished onboarding "
+             f"({describe_host(host) if host else 'not registered'}, "
+             f"{remaining}s left)...")
+        time.sleep(min(interval, max(remaining, 1)))
+
+    info("host never left its pending state; trying to enable DNS anyway, "
+         "because the API's answer is more trustworthy than this poll")
+    return host
+
+
+def enable_dns_service(client, pool_id, name=None, timeout=600, interval=20):
     """
     Create the DNS service on the host's pool.
 
@@ -390,33 +469,62 @@ def enable_dns_service(client, pool_id, name=None):
              f"{existing.get('name', existing.get('id', '?'))}")
         return existing, False
 
-    now = datetime.now(timezone.utc).isoformat()
     last = None
+    deadline = time.time() + timeout
 
-    for service_type in DNS_SERVICE_TYPES:
-        payload = {
-            "name": name,
-            "service_type": service_type,
-            "pool_id": f"infra/pool/{_bare(pool_id)}",
-            "desired_state": "start",
-            "created_at": now,
-            "updated_at": now,
-            "tags": {cfg.LAB_TAG_KEY: cfg.LAB_TAG_VALUE},
-        }
-        try:
-            body = client.post(cfg.path("infra_services"), json_body=payload)
-        except CspError as exc:
-            # A rejected service_type is a 400 or 422; try the others. Anything
-            # else is a real failure and should surface now.
-            if exc.status in (400, 422):
-                info(f"service_type {service_type!r} rejected: {exc.body[:160]}")
-                last = exc
-                continue
-            raise
+    while True:
+        for service_type in DNS_SERVICE_TYPES:
+            # Rebuilt each attempt so the timestamps are not stale by the time
+            # a retry actually sends them.
+            now = datetime.now(timezone.utc).isoformat()
+            payload = {
+                "name": name,
+                "service_type": service_type,
+                "pool_id": f"infra/pool/{_bare(pool_id)}",
+                "desired_state": "start",
+                "created_at": now,
+                "updated_at": now,
+                "tags": {cfg.LAB_TAG_KEY: cfg.LAB_TAG_VALUE},
+            }
+            try:
+                body = client.post(cfg.path("infra_services"),
+                                   json_body=payload)
+            except CspError as exc:
+                if exc.status in (400, 422):
+                    last = exc
+                    if _host_not_ready(exc):
+                        # NOT a rejected service_type. The type is right and
+                        # the host has not finished onboarding, so trying the
+                        # other spellings is pointless — they fail with the
+                        # genuinely different "Enter a valid service type".
+                        # Break out and wait instead.
+                        break
+                    info(f"service_type {service_type!r} rejected: "
+                         f"{exc.body[:160]}")
+                    continue
+                raise
 
-        service = body.get("result") or body
-        ok(f"enabled DNS service {name!r} (service_type={service_type!r})")
-        return service, True
+            service = body.get("result") or body
+            ok(f"enabled DNS service {name!r} (service_type={service_type!r})")
+            return service, True
+
+        if not (last and _host_not_ready(last)):
+            break
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        info(f"host is not ready for DNS yet ({int(remaining)}s left): "
+             f"{last.body[:120]}")
+        time.sleep(min(interval, max(remaining, 1)))
+
+    if last and _host_not_ready(last):
+        raise CspError("POST", cfg.path("infra_services"), 400,
+                       f"the host never became ready to run DNS within "
+                       f"{timeout}s. The CSP kept answering {last.body[:160]}. "
+                       f"That is the host still onboarding rather than a wrong "
+                       f"service type: this same AMI runs `dns` in "
+                       f"app-migration-niosx.")
 
     raise CspError("POST", cfg.path("infra_services"), 400,
                    f"no accepted service_type for DNS. Tried "
@@ -559,11 +667,11 @@ def join_server_group(client, host_id):
     return True
 
 
-def build(client, timeout=900, service_timeout=300):
+def build(client, timeout=900, service_timeout=300, online_timeout=600):
     """
     Wait for the host, enable DNS on it, and report what exists.
 
-    Returns the ids for seed_ids.json. Raises TimeoutError if the host never
+    Returns the ids for niosx_ids.json. Raises TimeoutError if the host never
     registers — the caller decides whether that is fatal.
     """
     print("\n=== NIOS-X host: registration and DNS service ===", flush=True)
@@ -574,6 +682,13 @@ def build(client, timeout=900, service_timeout=300):
         raise CspError("GET", cfg.path("detail_hosts"), 200,
                        f"host registered but exposes no pool id, so no service "
                        f"can be attached. Record keys: {', '.join(sorted(host))}")
+
+    # REGISTERED IS NOT THE SAME AS READY TO RUN DNS. wait_for_host returns as
+    # soon as there is a pool, which is the right bar for attaching a service
+    # and the wrong one for starting it — the first boot got a host at
+    # composite_status=pending and the CSP refused DNS on it. Both waits are
+    # best effort; enable_dns_service retries the real call regardless.
+    host = wait_until_online(client, timeout=online_timeout) or host
 
     service, created = enable_dns_service(client, pool_id)
     if created:
