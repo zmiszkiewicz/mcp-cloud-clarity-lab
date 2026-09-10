@@ -486,6 +486,33 @@ def wait_for_service(client, timeout=600, interval=20):
 # Orchestration
 # --------------------------------------------------------------------------- #
 
+def server_group_membership(client, host_id):
+    """
+    Where this host stands with the lab's DNS server group.
+
+    Returns one of "member", "not-member" or "no-group", and the distinction
+    between the last two matters at track start.
+
+    THE GROUP DOES NOT EXIST WHEN THE HOST IS BUILT. baseline.py creates
+    `techcorp-dc-servers` from seed_lab.py, which 01/setup-shell runs AFTER
+    track setup — while this host is registered during track setup. So at boot
+    the honest answer is "not yet", not "failed", and treating the two the same
+    would fail a track start over a step that has not been reached.
+
+    Read-only counterpart to join_server_group, so health() can ask without
+    the answer depending on a write.
+    """
+    group = client.find_by_name(cfg.path("dns_auth_nsg"),
+                                cfg.DNS_SERVER_GROUP_NAME)
+    if not group:
+        return "no-group"
+    members = group.get("internal_secondaries") or []
+    if any(_bare(m.get("host")) == _bare(host_id) for m in members
+           if isinstance(m, dict)):
+        return "member"
+    return "not-member"
+
+
 def join_server_group(client, host_id):
     """
     Put this host into the lab's DNS server group.
@@ -565,6 +592,122 @@ def build(client, timeout=900, service_timeout=300):
     }
 
 
+def port53_listening(timeout=20):
+    """
+    Whether anything is actually answering on the host's port 53, asked from
+    inside the VPC.
+
+    THE ONE CHECK THAT IS NOT TAKING THE CSP'S WORD FOR IT. Everything else
+    here reads objects: the host record says registered, the service record
+    says started. Both describe what the CSP was asked to do. Neither says a
+    process is bound to a socket.
+
+    The RPZ lab hit exactly this and left a note about it: the DFP service
+    reported "start" and port 53 was still dead eleven seconds later. Same
+    software, same registration path, so assume the same gap here.
+
+    Probed over TCP rather than with a query, deliberately. A query needs a
+    zone to ask about, and the lab's zone is not seeded until 01/setup-shell —
+    and Part 2's break then takes it off the server group on purpose, so a
+    query would correctly fail for most of the lab. A TCP connect asks only
+    "did this boot and is it reachable", which is the question at track start.
+
+    Returns (ok, detail). Never raises: the caller decides what a failure means.
+    """
+    try:
+        import cloud_vpc
+    except ImportError as exc:                              # noqa: BLE001
+        return False, f"cloud_vpc unavailable: {exc}"
+
+    host_ip = cfg.NIOSX_HOST_IP
+    probe = (
+        "python3 -c \"import socket,sys;"
+        "s=socket.socket();s.settimeout(5);"
+        f"sys.exit(s.connect_ex(('{host_ip}',53)))\""
+    )
+    result = cloud_vpc.run_on_test_vm(probe, timeout=timeout)
+
+    if not result["ok"]:
+        # The test VM itself is the problem, which is a different fault from
+        # the host being dead. Say which.
+        return False, (f"could not probe from the test VM: "
+                       f"{result.get('detail') or result.get('status')}")
+
+    if result.get("rc") == 0:
+        return True, f"{host_ip}:53 accepted a TCP connection from the VPC"
+
+    return False, (f"nothing is listening on {host_ip}:53 from inside the "
+                   f"VPC. The host may still be starting its DNS service, or "
+                   f"the security group may not allow port 53 from the VPC "
+                   f"CIDR.")
+
+
+def health(client, check_port=True, require_group=True):
+    """
+    Everything that has to be true for Part 3 to work, reported as a table.
+
+    Returns (ok, rows) where rows is a list of (label, passed, detail).
+
+    `require_group` is False at track start, where the server group has not
+    been seeded yet, and True afterwards. The zone points at the group, so a
+    host outside it never answers for svc.techcorp.internal however healthy it
+    otherwise looks — but that can only be judged once the group exists.
+    """
+    rows = []
+
+    host = find_host(client)
+    if not host:
+        rows.append(("host registered", False,
+                     "no NIOS-X host has called home to this tenant"))
+        return False, rows
+
+    rows.append(("host registered", True, describe_host(host)))
+
+    pool_id = _pool_id(host)
+    rows.append(("host has a pool", bool(pool_id),
+                 pool_id or "no pool id, so no service can attach to it"))
+
+    service = find_dns_service(client, pool_id)
+    if not service:
+        rows.append(("DNS service", False,
+                     "no DNS service on this host, so nothing serves queries"))
+    else:
+        state = (service_current_state(service)
+                 or service.get("desired_state") or "unknown")
+        running = str(state).strip().lower() in RUNNING_STATES
+        rows.append(("DNS service", running,
+                     f"{service.get('name', '?')} state={state}"))
+
+    membership = server_group_membership(client, host.get("id"))
+    label = f"in {cfg.DNS_SERVER_GROUP_NAME}"
+    if membership == "member":
+        rows.append((label, True, "member"))
+    else:
+        detail = ("the group does not exist yet — seeding has not run"
+                  if membership == "no-group" else
+                  "the zone points at this group; a host outside it never "
+                  "answers")
+        # require_group=False makes this row informational rather than
+        # load-bearing, which is what track start needs: the group is created
+        # by seeding, later. Reported either way, so the log shows the state
+        # rather than hiding it.
+        rows.append((label, not require_group, detail))
+
+    if check_port:
+        listening, detail = port53_listening()
+        rows.append(("port 53 answering", listening, detail))
+
+    return all(passed for _, passed, _ in rows), rows
+
+
+def print_health(rows):
+    """Render health() rows the way the other labs' status blocks read."""
+    width = max(len(label) for label, _, _ in rows)
+    for label, passed, detail in rows:
+        mark = "✅" if passed else "❌"
+        print(f"  {mark} {label.ljust(width)}  {detail}")
+
+
 def save_ids(ids):
     """
     Record what was built, next to the other state files.
@@ -612,6 +755,16 @@ def main():
     parser.add_argument("--token", action="store_true",
                         help="mint a join token, print it to stdout, and exit")
     parser.add_argument("--status", action="store_true", help="report only")
+    parser.add_argument("--health", action="store_true",
+                        help="check the host end to end; exit 1 if unhealthy")
+    parser.add_argument("--no-port-check", action="store_true",
+                        help="skip the port 53 probe, which needs the test VM")
+    parser.add_argument("--no-group-check", action="store_true",
+                        help="do not require server-group membership; used at "
+                             "track start, before seeding has created it")
+    parser.add_argument("--join-group", action="store_true",
+                        help="add the host to the server group and exit. Run "
+                             "after seeding, which is what creates the group")
     parser.add_argument("--wait-only", action="store_true",
                         help="wait for registration, enable nothing")
     parser.add_argument("--timeout", type=int, default=900,
@@ -635,6 +788,29 @@ def main():
     if args.status:
         show_status(client)
         return 0
+
+    if args.join_group:
+        # Separate from build() because the group is created by seeding, which
+        # runs after the host is built. build() attempts the join and reports
+        # "no group to join"; this is the second attempt, once there is one.
+        host = find_host(client)
+        if not host:
+            print("❌ no registered host to add to the server group")
+            return 1
+        return 0 if join_server_group(client, host.get("id")) else 1
+
+    if args.health:
+        print("=== NIOS-X host health ===")
+        healthy, rows = health(client,
+                               check_port=not args.no_port_check,
+                               require_group=not args.no_group_check)
+        print_health(rows)
+        if healthy:
+            print(f"\n✅ the DNS host is up and answering at {cfg.NIOSX_HOST_IP}")
+            return 0
+        print("\n❌ the DNS host is not fully healthy; Part 3 will not resolve.")
+        print("   Retry the CSP side with: bash /opt/lab/build-niosx.sh")
+        return 1
 
     if args.wait_only:
         wait_for_host(client, timeout=args.timeout)
