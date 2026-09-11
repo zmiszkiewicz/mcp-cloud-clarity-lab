@@ -667,7 +667,7 @@ def join_server_group(client, host_id):
     return True
 
 
-def build(client, timeout=900, service_timeout=300, online_timeout=600):
+def build(client, timeout=900, service_timeout=180, online_timeout=600):
     """
     Wait for the host, enable DNS on it, and report what exists.
 
@@ -692,6 +692,11 @@ def build(client, timeout=900, service_timeout=300, online_timeout=600):
 
     service, created = enable_dns_service(client, pool_id)
     if created:
+        # ADVISORY, AND SHORT ON PURPOSE. This and the port 53 probe in
+        # health() measure the same thing — whether DNS came up — so giving
+        # both a long budget just waits for the same event twice, serially.
+        # The port probe is the authoritative one, so the long timeout lives
+        # there and this only gives the CSP a moment to change its mind.
         wait_for_service(client, timeout=service_timeout)
 
     in_group = join_server_group(client, host.get("id"))
@@ -707,10 +712,10 @@ def build(client, timeout=900, service_timeout=300, online_timeout=600):
     }
 
 
-def port53_listening(timeout=20):
+def port53_listening(timeout=600, interval=20):
     """
     Whether anything is actually answering on the host's port 53, asked from
-    inside the VPC.
+    inside the VPC. Polls until `timeout`.
 
     THE ONE CHECK THAT IS NOT TAKING THE CSP'S WORD FOR IT. Everything else
     here reads objects: the host record says registered, the service record
@@ -719,7 +724,18 @@ def port53_listening(timeout=20):
 
     The RPZ lab hit exactly this and left a note about it: the DFP service
     reported "start" and port 53 was still dead eleven seconds later. Same
-    software, same registration path, so assume the same gap here.
+    software, same registration path, and the same gap showed up here — a
+    service sitting at state=starting with the port still refusing.
+
+    POLLED, NOT SAMPLED ONCE, for that reason. The service takes minutes to
+    bind after the CSP accepts it, so a single shot measures the clock rather
+    than the host. The RPZ lab waits up to 600s for the equivalent.
+
+    THE PROBE PRINTS ITS ANSWER, IT DOES NOT ENCODE IT IN AN EXIT CODE. An
+    earlier version returned connect_ex's errno as the exit status, which
+    collided with run_on_test_vm's own use of rc: ok is (rc == 0) there, so a
+    perfectly good probe reporting ECONNREFUSED came back as "could not probe
+    from the test VM" and the closed-port branch was unreachable.
 
     Probed over TCP rather than with a query, deliberately. A query needs a
     zone to ask about, and the lab's zone is not seeded until 01/setup-shell —
@@ -736,28 +752,46 @@ def port53_listening(timeout=20):
 
     host_ip = cfg.NIOSX_HOST_IP
     probe = (
-        "python3 -c \"import socket,sys;"
+        "python3 -c \"import socket;"
         "s=socket.socket();s.settimeout(5);"
-        f"sys.exit(s.connect_ex(('{host_ip}',53)))\""
+        f"print('OPEN' if s.connect_ex(('{host_ip}',53))==0 else 'CLOSED')\""
     )
-    result = cloud_vpc.run_on_test_vm(probe, timeout=timeout)
 
-    if not result["ok"]:
-        # The test VM itself is the problem, which is a different fault from
-        # the host being dead. Say which.
-        return False, (f"could not probe from the test VM: "
-                       f"{result.get('detail') or result.get('status')}")
+    deadline = time.time() + timeout
+    attempt = 0
+    last = "never ran"
 
-    if result.get("rc") == 0:
-        return True, f"{host_ip}:53 accepted a TCP connection from the VPC"
+    while True:
+        attempt += 1
+        result = cloud_vpc.run_on_test_vm(probe, timeout=60)
+        answer = (result.get("stdout") or "").strip()
 
-    return False, (f"nothing is listening on {host_ip}:53 from inside the "
-                   f"VPC. The host may still be starting its DNS service, or "
-                   f"the security group may not allow port 53 from the VPC "
-                   f"CIDR.")
+        if answer == "OPEN":
+            return True, (f"{host_ip}:53 accepted a TCP connection from the "
+                          f"VPC (attempt {attempt})")
+
+        if answer == "CLOSED":
+            last = (f"nothing is listening on {host_ip}:53 from inside the "
+                    f"VPC")
+        else:
+            # No usable answer means the probe itself did not run — the test
+            # VM, not the DNS host. A different fault needing a different fix,
+            # so it is reported as itself rather than as a dead port.
+            last = (f"could not probe from the test VM: "
+                    f"{result.get('detail') or result.get('status')}")
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        info(f"⏳ {last}; retrying ({int(remaining)}s left)...")
+        time.sleep(min(interval, max(remaining, 1)))
+
+    return False, (f"{last}. Gave up after {timeout}s. The DNS service may "
+                   f"still be starting, or the security group may not allow "
+                   f"port 53 from the VPC CIDR.")
 
 
-def health(client, check_port=True, require_group=True):
+def health(client, check_port=True, require_group=True, port_timeout=600):
     """
     Everything that has to be true for Part 3 to work, reported as a table.
 
@@ -809,7 +843,7 @@ def health(client, check_port=True, require_group=True):
         rows.append((label, not require_group, detail))
 
     if check_port:
-        listening, detail = port53_listening()
+        listening, detail = port53_listening(timeout=port_timeout)
         rows.append(("port 53 answering", listening, detail))
 
     return all(passed for _, passed, _ in rows), rows
@@ -877,6 +911,9 @@ def main():
     parser.add_argument("--no-group-check", action="store_true",
                         help="do not require server-group membership; used at "
                              "track start, before seeding has created it")
+    parser.add_argument("--port-timeout", type=int, default=600,
+                        help="seconds to wait for port 53 to start answering. "
+                             "Long at track start, short for a recheck")
     parser.add_argument("--join-group", action="store_true",
                         help="add the host to the server group and exit. Run "
                              "after seeding, which is what creates the group")
@@ -918,7 +955,8 @@ def main():
         print("=== NIOS-X host health ===")
         healthy, rows = health(client,
                                check_port=not args.no_port_check,
-                               require_group=not args.no_group_check)
+                               require_group=not args.no_group_check,
+                               port_timeout=args.port_timeout)
         print_health(rows)
         if healthy:
             print(f"\n✅ the DNS host is up and answering at {cfg.NIOSX_HOST_IP}")
