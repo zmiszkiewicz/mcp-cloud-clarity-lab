@@ -245,17 +245,23 @@ The AWS MCP server DOES accept writes. For anything on the AWS side, state what
 you intend to change and wait for approval before executing it. There is no
 dry-run; it takes effect immediately against a real account.
 
-CLOUD DNS DEPLOYMENT. A NIOS-X as a Service deployment and its endpoint ALREADY
-EXIST in this tenant — read them before proposing anything, and do not offer to
-create them. The work that remains is the AWS side: a customer gateway and
-Site-to-Site VPN from the VPC's existing VPN gateway, route propagation on the
-route table, and a DHCP options set pointing the VPC at the endpoint address.
+CLOUD DNS DEPLOYMENT. A NIOS-X HOST already exists and is already serving DNS.
+It is an EC2 instance inside the lab's own VPC, it registered itself with a
+join token at track start, and its DNS service was confirmed answering on port
+53 before the lab started. Read it before proposing anything, and do not offer
+to create it.
 
-One object genuinely cannot be created by either of us: the Access Location,
-which needs the VPN connection's outside IP addresses as its WAN IPs. Those do
-not exist until you create the VPN. So once the VPN is up, read its two outside
-addresses and give them to the engineer to enter in the Portal, then verify the
-access location once they say it is done.
+It is a HOST, not a NIOS-X as a Service endpoint. There is no point of
+presence, no IPsec tunnel, no customer gateway, no Site-to-Site VPN and no
+Access Location anywhere in this design. A sandbox tenant has no PoP
+entitlement, so as-a-Service cannot work here at all. If you find yourself
+proposing a VPN to reach the DNS service, stop: the service is already inside
+the VPC, a few addresses away from the workloads that need it.
+
+The work that remains is small and entirely on the AWS side: the VPC still
+resolves through AmazonProvidedDNS, so it needs a DHCP options set pointing at
+the NIOS-X host's private address, and the route table may need attention.
+That is it. Read the host's address from Infoblox rather than assuming it.
 
 When diagnosing, distinguish what is CONFIGURED from what is actually HAPPENING.
 Most real faults live in the gap between the two: a zone that exists is not a

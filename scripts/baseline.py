@@ -23,6 +23,8 @@ findings shape this file and are worth knowing before editing:
     objects rather than one object with bounds.
 """
 
+import time
+
 import lab_config as cfg
 from csp_client import info, object_url, ok
 
@@ -243,6 +245,32 @@ def resolve_dns_authority(client):
 
     if mode in ("auto", "host"):
         host = find_dc_host(client, data)
+
+        # TWO APIS, AND THEY DO NOT UPDATE TOGETHER.
+        #
+        # Track setup proves the host is up by reading /api/infra/v1 and by
+        # connecting to port 53. find_dc_host reads /api/ddi/v1/dns/host,
+        # which is the DNS view — a host appears there only once its DNS
+        # service is registered on the DDI side, and that lags the infra
+        # record by an unknown amount.
+        #
+        # So a host we have just watched answer a TCP connection can still be
+        # absent here for a little while. With mode pinned to `host` that
+        # would be a hard SystemExit on a tenant that is merely slow, which is
+        # a bad way to lose a track start. Only worth waiting when the
+        # operator asked for `host` specifically; `auto` has a fallback and
+        # should take it rather than stall.
+        if not host and mode == "host":
+            for attempt in range(cfg.HOST_VISIBILITY_ATTEMPTS):
+                info(f"host not visible in {cfg.path('dns_host')} yet "
+                     f"(attempt {attempt + 1}); the infra record and the DNS "
+                     f"record do not appear at the same moment")
+                time.sleep(cfg.HOST_VISIBILITY_INTERVAL)
+                data = inventory(client)
+                host = find_dc_host(client, data)
+                if host:
+                    break
+
         if host:
             name = host.get("name") or host.get("absolute_name")
             ok(f"DNS authority: host {name} (LAB_AUTH_MODE={mode})")

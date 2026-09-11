@@ -311,12 +311,27 @@ BASELINE_CNAME_RECORDS = {
 #          actually serves the zone, so there is no live NXDOMAIN to dig for.
 #
 #   auto   Use a host if the tenant has one, otherwise fall back to a server
-#          group. The default, because a broker-allocated sandbox turns out not
-#          to ship with a host and a lab that refuses to start is worse than one
-#          that starts slightly less vividly.
+#          group. The historical default, from when a broker-allocated sandbox
+#          did not ship with a host.
+#
+# THE TRACK NOW PINS host. The lab builds its own NIOS-X host and gates the
+# track start on it answering on port 53, so the fallback exists to cover a
+# case that can no longer occur — and leaving it available meant a slow
+# registration silently swapped one lab for another, differing in whether Part
+# 2's fix actually makes DNS work. See LAB_AUTH_MODE in track_scripts/setup-shell.
+#
+# `nsg` and `auto` are kept for running against a tenant with no host of its
+# own, which is still a legitimate way to exercise Parts 1, 2 and 4.
 #
 # resolve_dns_authority() logs which one it picked and why.
 AUTH_MODE = os.environ.get("LAB_AUTH_MODE", "auto")
+
+# How long resolve_dns_authority waits for a host it knows exists to surface
+# in the DDI DNS-host API. The infra record and the DNS record do not appear
+# at the same moment, and with AUTH_MODE pinned to `host` the difference is
+# otherwise a hard failure on a tenant that is merely slow.
+HOST_VISIBILITY_ATTEMPTS = int(os.environ.get("LAB_HOST_VISIBILITY_ATTEMPTS", "10"))
+HOST_VISIBILITY_INTERVAL = int(os.environ.get("LAB_HOST_VISIBILITY_INTERVAL", "15"))
 
 # Used when AUTH_MODE resolves to `host`. Not created by this lab.
 DC_HOST_NAME = os.environ.get("LAB_DC_HOST", "niosx-dc-01")
