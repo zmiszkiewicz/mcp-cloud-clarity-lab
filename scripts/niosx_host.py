@@ -846,6 +846,36 @@ def health(client, check_port=True, require_group=True, port_timeout=600):
         listening, detail = port53_listening(timeout=port_timeout)
         rows.append(("port 53 answering", listening, detail))
 
+    # INFORMATIONAL, NOT A GATE — but printed, because it is the one thing
+    # that can still fail after this check passes.
+    #
+    # Seeding resolves the zone's authority through /api/ddi/v1/dns/host, a
+    # different API from the /api/infra/v1 records above. With LAB_AUTH_MODE
+    # pinned to `host`, a host missing there is a hard failure in
+    # 01/setup-shell — fifteen minutes after this check said everything was
+    # fine. Saying so here turns that into something recognisable rather than
+    # a surprise in a later challenge.
+    #
+    # Not a gate because the two APIs do not update together and
+    # resolve_dns_authority waits 150s of its own. Failing the boot on a lag
+    # that the consumer already tolerates would break labs that would have
+    # worked.
+    try:
+        ddi_hosts = client.list_results(cfg.path("dns_host"))
+        if ddi_hosts:
+            names = [h.get("name") or h.get("absolute_name") or "?"
+                     for h in ddi_hosts]
+            print(f"   (visible to DDI as: {', '.join(names)})")
+        else:
+            print("   ⚠️  the host is NOT yet listed in "
+                  f"{cfg.path('dns_host')}, which is where seeding looks for "
+                  "it. That usually settles within a minute or two; "
+                  "01/setup-shell waits. If Part 1 then fails with "
+                  "'LAB_AUTH_MODE=host was requested but this tenant has no "
+                  "usable Universal DDI host', this was the warning.")
+    except Exception as exc:                                # noqa: BLE001
+        print(f"   (could not check DDI host visibility: {exc})")
+
     return all(passed for _, passed, _ in rows), rows
 
 
