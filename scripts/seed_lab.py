@@ -107,7 +107,7 @@ def assert_all(client, ids, expected):
     failures = []
     print("\n=== Asserting seeded state ===", flush=True)
     for name in expected:
-        passed, reason = breaks.BREAKS[name]["assert"](client, ids)
+        passed, reason = breaks.ALL_BREAKS[name]["assert"](client, ids)
         if passed:
             ok(f"{name}: {reason}")
         else:
@@ -143,9 +143,9 @@ def main():
         # --fix runs alone: it is the reset path, not part of seeding.
         if args.fix_name:
             for name in args.fix_name:
-                if name not in breaks.BREAKS:
+                if name not in breaks.ALL_BREAKS:
                     raise SystemExit(f"❌ unknown break {name!r}; try --list")
-                breaks.BREAKS[name]["fix"](client, ids)
+                breaks.ALL_BREAKS[name]["fix"](client, ids)
             return 0
 
         if args.assert_only:
@@ -158,12 +158,12 @@ def main():
 
         selected = args.break_name or list(breaks.BREAKS)
         for name in selected:
-            if name not in breaks.BREAKS:
+            if name not in breaks.ALL_BREAKS:
                 raise SystemExit(f"❌ unknown break {name!r}; try --list")
 
         print("\n=== Applying breaks ===", flush=True)
         for name in selected:
-            breaks.BREAKS[name]["apply"](client, ids)
+            breaks.ALL_BREAKS[name]["apply"](client, ids)
 
         failures = assert_all(client, ids, selected)
 

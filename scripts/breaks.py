@@ -176,15 +176,38 @@ BREAKS = {
         "assert": assert_zone_missing_auth_server,
         "fix": fix_zone_missing_auth_server,
     },
+}
+
+# RETIRED, not deleted.
+#
+# Part 4 used to be "something else is broken, find it" and this was the
+# something. It is now an IPAM allocation exercise instead, and a seeded fault
+# that no challenge ever resolves is worse than no fault at all: it leaves the
+# tenant permanently broken, and a participant exploring DHCP in Part 2 finds
+# a real problem that the lab never acknowledges.
+#
+# seed_lab iterates BREAKS, so moving it here stops it being applied while
+# keeping it usable by name for anyone who wants the old exercise back:
+#
+#     python3 seed_lab.py --break dhcp_range_overlap
+#
+# It also retires TODO-15, the unconfirmed lease-listing endpoint, which only
+# ever mattered for verifying this one.
+RETIRED_BREAKS = {
     "dhcp_range_overlap": {
         "part": 4,
         "summary": "Branch-02 DHCP range collides with the reserved block "
-                   "(unguided)",
+                   "(unguided, retired)",
         "apply": break_dhcp_range_overlap,
         "assert": assert_dhcp_range_overlap,
         "fix": fix_dhcp_range_overlap,
     },
 }
+
+# What `--break NAME` and `--fix NAME` resolve against. BREAKS is what gets
+# applied by default; this is what can be named explicitly, so a retired
+# break stays reachable by anyone who wants it without coming back.
+ALL_BREAKS = {**BREAKS, **RETIRED_BREAKS}
 
 
 # --------------------------------------------------------------------------- #

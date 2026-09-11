@@ -714,6 +714,42 @@ def vpc_dhcp_dns_servers():
         return [], f"could not read the VPC's DHCP options: {exc}"
 
 
+def find_vpcs_by_cidr(cidr):
+    """
+    Every VPC in the region whose CIDR matches, for Part 4.
+
+    Matched on the CIDR rather than on a name or a tag, deliberately. The
+    exercise is that the address space AWS is using is the one IPAM recorded,
+    and a participant who names the VPC something sensible of their own should
+    pass. The range is the claim being checked; the label is decoration.
+
+    Searches ALL CIDR blocks on each VPC, not just the primary — a VPC can
+    carry several, and one added as a secondary is still an allocation of that
+    space.
+
+    Returns (vpcs, detail) where each vpc is {"id", "name", "cidrs"}.
+    """
+    try:
+        response = _client("ec2").describe_vpcs()
+    except Exception as exc:                                # noqa: BLE001
+        return [], f"Could not list VPCs: {exc}"
+
+    matched, seen = [], []
+    for vpc in response.get("Vpcs", []):
+        cidrs = [a["CidrBlock"] for a in vpc.get("CidrBlockAssociationSet", [])
+                 if a.get("CidrBlockState", {}).get("State") == "associated"]
+        if not cidrs and vpc.get("CidrBlock"):
+            cidrs = [vpc["CidrBlock"]]
+        seen.extend(cidrs)
+
+        if cidr in cidrs:
+            name = next((t["Value"] for t in vpc.get("Tags", [])
+                         if t.get("Key") == "Name"), "")
+            matched.append({"id": vpc["VpcId"], "name": name, "cidrs": cidrs})
+
+    return matched, f"VPCs in this region currently use: {', '.join(sorted(set(seen)))}."
+
+
 def set_vpc_dns(servers):
     """
     Point the VPC at these resolvers, by creating and attaching a DHCP

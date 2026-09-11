@@ -5,7 +5,7 @@ Validate each part's END STATE against the Infoblox API and the AWS API.
     verify_lab.py --stage c1     Part 1  the connection is real
     verify_lab.py --stage c2     Part 2  INC-4471 is actually fixed
     verify_lab.py --stage c3     Part 3  DNS resolves from inside the VPC
-    verify_lab.py --stage c4     Part 4  the unguided break was found and fixed
+    verify_lab.py --stage c4     Part 4  IPAM and AWS agree on the new /24
     verify_lab.py --stage all    everything, for a maintainer smoke test
 
 NEVER PARSE THE CHAT TRANSCRIPT. The agent's wording is nondeterministic — the
@@ -317,99 +317,74 @@ def _check_c3_cloud(cloud_vpc):
 
 def check_c4(client, ids):
     """
-    The access-control exercise and the tool-discovery exercise are both
-    read-only and leave nothing behind to verify — they are for the
-    participant's understanding. What IS verifiable is that the unguided break
-    was found and fixed with no prompt scaffolding, which is the real skills
-    test in this part.
+    Part 4 is one exercise with two halves, and the point is that they have to
+    agree:
+
+      1. The next free /24 exists as a subnet in Infoblox IPAM.
+      2. A VPC with that exact CIDR exists in AWS.
+
+    Neither half is interesting alone. A subnet in IPAM that nobody built is a
+    spreadsheet entry; a VPC whose range nobody recorded is how two teams
+    allocate the same /24 and find out at the worst possible moment. What is
+    being checked is that the address space the cloud is using is the address
+    space IPAM says it is using.
+
+    THE EXPECTED CIDR IS DECLARED, NOT DERIVED. cfg.PART4_SUBNET is written
+    down rather than computed from the seeded subnets, because a check that
+    works the answer out the same way the participant does would agree with
+    them even when both are wrong.
     """
-    import breaks
+    import cloud_vpc
+    from cloud_vpc import CloudUnavailable
 
-    # -- If a read-only key exists, confirm it really is read-only -----------
-    #
-    # Only present when MCP_ROLES includes read_only. With the default single
-    # read/write key there is nothing to probe: Part 4's access-control lesson
-    # now rests on the MCP Server not exposing user administration at all,
-    # which needs no assertion because the tool simply is not there.
-    ro_key = read_state("mcp_ro_key", required=False)
-    if ro_key:
-        ro_client = CspClient.from_service_key(ro_key)
-        try:
-            ro_client.post(cfg.path("dns_view"), json_body={
-                "name": f"rbac-probe-{cfg.PARTICIPANT_ID}",
-            }, expect={403, 401})
-            ok("read-only key is correctly refused write access")
-        except CspError as exc:
-            if exc.status in (200, 201):
-                fail("The read-only key was able to write. This is a lab "
-                     "defect, not your mistake — tell your facilitator.")
-            info(f"read-only write probe returned {exc.status} "
-                 f"(treated as denied)")
+    expected = f"{cfg.PART4_SUBNET['address']}/{cfg.PART4_SUBNET['cidr']}"
 
-    # -- The unguided break has been fixed -----------------------------------
-    dhcp_range = client.get(object_url(cfg.path("dhcp_range"), ids["range_id"]))
-    dhcp_range = dhcp_range.get("result", dhcp_range)
-    start, end = dhcp_range.get("start"), dhcp_range.get("end")
-
-    if breaks.ranges_overlap(start, end,
-                             cfg.BRANCH_RESERVED_BLOCK["start"],
-                             cfg.BRANCH_RESERVED_BLOCK["end"]):
-        fail(f"There is still a misconfiguration in this tenant that nobody "
-             f"described to you. Something in "
-             f"{cfg.SUBNETS['branch-02']['address']}/"
-             f"{cfg.SUBNETS['branch-02']['cidr']} means clients there cannot "
-             f"be given an address. Use the assistant to find it — start by "
-             f"asking what looks wrong with DHCP on that network.")
-
-    ok(f"Branch-02 DHCP range {start}-{end} is clear of the reserved "
-       f"fixed-address block")
-
-    # Utilization is the symptom the participant was chasing; it should have
-    # come back down once the range moved.
-    util = dhcp_range.get("utilization")
-    pct = None
-    if isinstance(util, dict):
-        pct = util.get("utilization", util.get("dhcp_utilization"))
-    elif util is not None:
-        pct = util
-
-    if pct is not None and float(pct) >= cfg.UTILIZATION_THRESHOLD_PCT:
-        fail(f"Branch-02 utilization is still {pct}%. The range no longer "
-             f"overlaps the reserved block, but there are still effectively no "
-             f"assignable addresses in it — widen it further.")
-    if pct is not None:
-        ok(f"Branch-02 utilization is {pct}%")
-
-    check_lease_issued(client, ids)
-
-
-def check_lease_issued(client, ids):
-    """
-    Confirm the branch client host actually got an address.
-
-    TODO-15 — the lease-listing endpoint is the unknown. This is the most
-    valuable assertion in Part 4 if it can be made to work: a range that looks
-    correct but issues no leases is exactly the failure mode being taught, so
-    "the config looks right" is not really good enough. Skipped until the
-    endpoint is confirmed.
-    """
+    # -- 1. The allocation, recorded in IPAM ---------------------------------
     try:
-        leases = client.list_results(
-            cfg.path("dhcp_lease"),
-            params={"_filter": f'hardware=="{cfg.CLIENT_HOST_MAC}"'},
-        )
-    except LabTodo as todo:
-        info(f"lease check unavailable — {todo}")
-        return
+        subnets = client.list_results(cfg.path("ipam_subnet"))
+    except CspError as exc:
+        fail(f"Could not read IPAM subnets to verify the allocation: {exc}")
 
-    if not leases:
-        fail(f"No DHCP lease has been issued to {cfg.CLIENT_HOST_NAME} yet. "
-             f"The range looks right — request a fresh lease from the client "
-             f"host, then click Check again.")
+    def _cidr_of(subnet):
+        address = subnet.get("address") or ""
+        prefix = subnet.get("cidr")
+        return f"{address}/{prefix}" if address and prefix else ""
 
-    addresses = [lease.get("address") for lease in leases]
-    ok(f"{cfg.CLIENT_HOST_NAME} holds a lease: "
-       f"{', '.join(a for a in addresses if a)}")
+    found = [s for s in subnets if _cidr_of(s) == expected]
+    if not found:
+        allocated = sorted(filter(None, (_cidr_of(s) for s in subnets)))
+        fail(f"No subnet for {expected} exists in IPAM yet. Ask the assistant "
+             f"for the next available /24 in {cfg.IP_SPACE_NAME}, then create "
+             f"it in the Portal under Configure -> Networking -> IPAM/DHCP. "
+             f"Currently allocated: {', '.join(allocated) or 'nothing'}.")
+
+    ok(f"{expected} is allocated in IPAM as "
+       f"{found[0].get('name') or '(unnamed)'}")
+
+    # -- 2. The VPC built from it --------------------------------------------
+    try:
+        _check_c4_cloud(cloud_vpc, expected)
+    except CloudUnavailable as exc:
+        fail(f"{exc} That is an environment fault, not your mistake — tell "
+             f"your facilitator.")
+
+
+def _check_c4_cloud(cloud_vpc, expected):
+    """The AWS half. Split out so one wrapper catches CloudUnavailable."""
+    vpcs, detail = cloud_vpc.find_vpcs_by_cidr(expected)
+
+    if not vpcs:
+        fail(f"IPAM says {expected} is allocated, but no VPC in AWS uses it. "
+             f"{detail} Ask the assistant to create one with that CIDR — it "
+             f"has write access to AWS, so it can do this itself with your "
+             f"approval.")
+
+    names = [v["name"] or v["id"] for v in vpcs]
+    ok(f"VPC {', '.join(names)} in AWS uses {expected}, matching IPAM")
+
+    if len(vpcs) > 1:
+        info(f"{len(vpcs)} VPCs share {expected} — harmless here, but in a "
+             f"real account that is the collision IPAM exists to prevent")
 
 
 # --------------------------------------------------------------------------- #

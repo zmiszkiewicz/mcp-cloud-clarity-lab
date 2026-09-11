@@ -369,6 +369,28 @@ BRANCH_RANGE_HEALTHY = {
 }
 
 # The reserved fixed addresses the IPAM cleanup was supposed to avoid.
+# --------------------------------------------------------------------------- #
+# Part 4 — allocate a network from IPAM, then build it in AWS
+# --------------------------------------------------------------------------- #
+# THE ANSWER IPAM SHOULD GIVE. With 10.30.0.0/16 holding 10.30.1.0/24 and
+# 10.30.2.0/24, the next free /24 is 10.30.3.0/24. Declared rather than
+# computed because the CHECK needs to know what correct looks like, and a
+# check that derives the answer the same way the participant does would agree
+# with them even when both are wrong.
+#
+# Keep in step with SUBNETS above: adding a seeded subnet moves this.
+PART4_SUBNET = {
+    "address": os.environ.get("LAB_PART4_SUBNET_ADDR", "10.30.3.0"),
+    "cidr": int(os.environ.get("LAB_PART4_SUBNET_CIDR", "24")),
+    "name": os.environ.get("LAB_PART4_SUBNET_NAME", "Cloud-01"),
+    "comment": "Allocated from IPAM for a new cloud VPC",
+}
+
+# What the participant names the VPC they build from that allocation. Matched
+# loosely by the check — the CIDR is what has to be right, not the label.
+PART4_VPC_NAME = os.environ.get("LAB_PART4_VPC_NAME", "techcorp-cloud-01")
+
+
 BRANCH_RESERVED_BLOCK = {
     "start": os.environ.get("LAB_RESERVED_START", "10.30.2.10"),
     "end": os.environ.get("LAB_RESERVED_END", "10.30.2.30"),
@@ -634,13 +656,15 @@ PATHS = {
     "us_associations":
         "/api/ddi/v1/dns/universal_service/{service_id}/associations",
 
-    "dhcp_lease": Todo(
-        "TODO-15",
-        "Which endpoint LISTS active DHCP leases? The ipam package only exposes "
-        "POST /dhcp/leases_command (for clearing leases) — there is no "
-        "lease-list operation in the public Go client. Part 4's final assertion "
-        "wants to prove a lease was issued to the branch client host.",
-    ),
+    # TODO-15 (dhcp_lease) is RESOLVED BY DELETION rather than by an answer.
+    #
+    # It existed because Part 4's old unguided exercise was a DHCP range
+    # collision, and proving the fix properly meant showing a lease had been
+    # issued — which needed a lease-listing endpoint the public Go client does
+    # not have. Part 4 is now an IPAM allocation exercise and that break is
+    # retired (see breaks.RETIRED_BREAKS), so nothing needs the path.
+    #
+    # Reinstate this if the DHCP break ever comes back.
     "dns_activity_cube": Todo(
         "TODO-16",
         "Which endpoint backs the DNS activity analytics the Part 1 and Part 2 "
