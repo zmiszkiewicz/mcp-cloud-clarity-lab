@@ -179,99 +179,57 @@ def check_zone_resolves():
 
 def check_c3(client, ids):
     """
-    Three conditions, weighted by who is responsible for them:
+    Two conditions, weighted by who is responsible for them:
 
-      1. The Universal Service exists.        SEEDING built this, not the
-                                              participant. Checked as an
-                                              environment sanity test, and a
-                                              failure here is reported as the
-                                              track's fault rather than theirs.
-      2. An Access Location is attached.      Participant work — Step 3.
-      3. The test VM resolves the zone.       Participant work, load-bearing.
+      1. The NIOS-X host is serving DNS.      TRACK SETUP built this, not the
+                                              participant, and gated the start
+                                              on it. A failure here is the
+                                              environment's fault and the
+                                              wording says so.
+      2. The test VM resolves the zone.       Participant work, load-bearing.
 
-    (3) is the one that matters, and it runs unconditionally. It is the only one
-    that cannot be satisfied by a half-built deployment: a service that exists
-    but has no working path into the VPC passes an object-existence check and
-    fails a dig, and the dig is what the cloud team actually cares about.
+    (2) is the one that matters. It is the only one a half-finished deployment
+    cannot fake: a host that is healthy and a VPC that has not been pointed at
+    it passes every object-existence check and fails a dig, and the dig is what
+    the cloud team actually cares about.
 
-    The distinction in (1) is the point. Since scripts/service_deployment.py
-    pre-creates the service at boot, its presence proves nothing about the
-    participant — telling them "you have not created the service yet" when the
-    track failed to create it would send them hunting for work that was never
-    theirs.
+    THIS USED TO CHECK A UNIVERSAL SERVICE AND AN ACCESS LOCATION. Both belong
+    to NIOS-X as a Service, which a sandbox tenant cannot have — the PoP
+    entitlement is missing, so every service location was refused. The lab
+    builds a NIOS-X host in its own VPC instead. The old check outlived the
+    architecture by several commits and failed Part 3 with "the Universal
+    Service does not exist", which was true, permanent, and nothing to do with
+    the participant.
     """
     import cloud_vpc
     from cloud_vpc import CloudUnavailable
 
-    # -- 1. The service seeding built ----------------------------------------
-    service = None
-    try:
-        deployments = client.list_results(cfg.path("universal_service"))
-        named = [d for d in deployments
-                 if d.get("name") == cfg.SERVICE_DEPLOYMENT_NAME]
-        if not named:
-            # Not the participant's fault, and the wording has to say so.
-            fail(f"The Universal Service '{cfg.SERVICE_DEPLOYMENT_NAME}' does "
-                 f"not exist. It is created when the track starts, not by you, "
-                 f"so this is an environment fault — tell your facilitator, and "
-                 f"check the 'NIOS-X as a Service' section of the seeding log.")
-        service = named[0]
-        ok(f"Universal Service {cfg.SERVICE_DEPLOYMENT_NAME} exists "
-           f"(built at track start)")
-
-        # Existing and being able to serve DNS are different things. A live
-        # sandbox refused the DNS capability outright — "capability 'DNS' is
-        # not allowed" — and seeding creates the service anyway so there is
-        # something to inspect. Saying so here beats letting the participant
-        # discover it as an unexplained timeout in step 3.
-        caps = service.get("capabilities") or []
-        if not any("dns" in str(c.get("type", "")).lower() for c in caps):
-            info(f"the service has no DNS capability, so it cannot serve "
-                 f"{cfg.ZONE_FQDN}. The tenant refused to attach one at track "
-                 f"start — an account entitlement, not anything you did.")
-    except LabTodo as todo:
-        info(f"Infoblox-side service check unavailable — {todo}")
-    except CspError as exc:
-        info(f"Infoblox-side service lookup failed: {exc}")
-
-    # -- 2. The access location the participant added ------------------------
-    #
-    # This one IS theirs: it needs the VPN's outside addresses, which do not
-    # exist until Step 2 creates the VPN, so it cannot be pre-built. Advisory
-    # rather than fatal — (3) is the real proof, and if DNS resolves then the
-    # path plainly works whatever this endpoint reports.
-    if service is not None:
-        try:
-            locations = client.list_results(cfg.path("access_locations"))
-            mine = [loc for loc in locations
-                    if loc.get("name") == cfg.ACCESS_LOCATION_NAME]
-            if mine:
-                wan = mine[0].get("wan_ip_addresses") or []
-                ok(f"Access Location {cfg.ACCESS_LOCATION_NAME} exists "
-                   f"({len(wan)} WAN address(es))")
-            else:
-                info(f"no Access Location named "
-                     f"'{cfg.ACCESS_LOCATION_NAME}' yet — Step 3 adds it with "
-                     f"the VPN's outside addresses")
-        except (LabTodo, CspError) as exc:
-            info(f"could not read access locations: {exc}")
-
-    # A DNS service on a Universal DDI host is readable today, so check that
-    # too. In `forwarder` mode this is the object doing the work.
+    # -- 1. The host and service track setup built ---------------------------
     try:
         services = client.list_results(cfg.path("infra_services"))
         dns_services = [s for s in services
                         if (s.get("service_type") or "").lower() == "dns"]
-        if dns_services:
-            unhealthy = [s.get("name") for s in dns_services
-                         if s.get("desired_state") == "start"
-                         and (s.get("status") or "").lower() not in
-                         ("", "started", "healthy", "running")]
-            if unhealthy:
-                info(f"DNS services not reporting healthy: {unhealthy}")
-            ok(f"{len(dns_services)} DNS service(s) registered in Universal DDI")
+
+        if not dns_services:
+            # Not the participant's fault, and the wording has to say so.
+            fail(f"No DNS service exists in this tenant. The NIOS-X host and "
+                 f"its DNS service are built when the track starts, not by "
+                 f"you, so this is an environment fault — tell your "
+                 f"facilitator. The boot log's 'NIOS-X DNS host' section says "
+                 f"what happened.")
+
+        named = [s for s in dns_services
+                 if s.get("name") == cfg.DNS_SERVICE_NAME]
+        service = (named or dns_services)[0]
+
+        state = (service.get("composite_state") or service.get("status")
+                 or service.get("desired_state") or "unknown")
+        ok(f"DNS service {service.get('name', '?')} exists "
+           f"(state={state}, built at track start)")
+    except LabTodo as todo:
+        info(f"Infoblox-side service check unavailable — {todo}")
     except CspError as exc:
-        info(f"could not list infrastructure services: {exc}")
+        info(f"Infoblox-side service lookup failed: {exc}")
 
     # -- 3. Resolution from inside the VPC ----------------------------------
     #
@@ -287,27 +245,33 @@ def check_c3(client, ids):
 
 
 def _check_c3_cloud(cloud_vpc):
-    """The AWS half of Part 3's check. Split out so one wrapper catches it all."""
+    """
+    The AWS half of Part 3's check. Split out so one wrapper catches it all.
+
+    THE PARTICIPANT'S ACTUAL WORK IS THE DHCP OPTIONS SET. This used to check
+    IPsec tunnels to an Infoblox point of presence, which no longer exist in
+    any mode — the DNS host lives inside the VPC, so there is nothing to
+    tunnel to. A check for a VPN that the lab never creates fails permanently
+    and blames the participant for not building it.
+    """
     cloud_vpc.describe()
 
-    if cfg.C3_MODE == "as-a-service":
-        up, total, detail = cloud_vpc.vpn_tunnel_state()
-        if not total:
-            # Nothing to bring up yet. Different advice from "it exists and is
-            # down", which is why vpn_tunnel_state distinguishes the two.
-            fail(detail)
-        if not up:
-            fail(f"A Site-to-Site VPN to the Infoblox point of presence exists, "
-                 f"but no tunnel is up yet ({detail}). Until at least one comes "
-                 f"up, DNS queries from {cfg.VPC_NAME} cannot reach the "
-                 f"service. Tunnels take a couple of minutes to establish — "
-                 f"check again shortly.")
-        ok(f"{up}/{total} IPsec tunnel(s) up ({detail})")
-    else:
-        targets, detail = cloud_vpc.resolver_rule_targets()
-        if not targets:
-            fail(detail)
-        ok(detail)
+    expected = cloud_vpc.dns_service_ip()
+    servers, detail = cloud_vpc.vpc_dhcp_dns_servers()
+
+    if not servers:
+        fail(f"{cfg.VPC_NAME} is not handing out the Infoblox DNS host as its "
+             f"resolver: {detail}. Workloads in the VPC will keep using "
+             f"AmazonProvidedDNS, which knows nothing about "
+             f"{cfg.ZONE_FQDN}. Attach a DHCP options set naming the DNS "
+             f"host to the VPC.")
+
+    if expected and expected not in servers:
+        fail(f"The VPC's DHCP options hand out {', '.join(servers)}, which "
+             f"does not include the DNS host at {expected}. Workloads will "
+             f"ask the wrong resolver.")
+
+    ok(f"{cfg.VPC_NAME} hands out {', '.join(servers)} as its resolver")
 
     # The same probe the participant runs with `lab-dig`, so there is never an
     # "it works for the check but not for me".

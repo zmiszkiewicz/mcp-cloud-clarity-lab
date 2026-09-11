@@ -714,6 +714,49 @@ def vpc_dhcp_dns_servers():
         return [], f"could not read the VPC's DHCP options: {exc}"
 
 
+def set_vpc_dns(servers):
+    """
+    Point the VPC at these resolvers, by creating and attaching a DHCP
+    options set. This is the participant's Part 3 work, done in code.
+
+    Exists for solve-shell. `instruqt track test` needs a way to complete the
+    challenge without a human driving the assistant, and this is now the whole
+    of the AWS side — small enough to be worth automating, which the VPN it
+    replaced never was.
+
+    TAGGED, because it outlives `terraform destroy`. AWS detaches a custom
+    options set when the VPC goes but does not delete it, so an untagged one
+    leaks a little rubbish into the account on every test run.
+
+    Returns (ok, detail). Never raises.
+    """
+    vpc_id = outputs().get("vpc_id")
+    if not vpc_id:
+        return False, "no vpc_id in the terraform outputs"
+
+    try:
+        ec2 = _client("ec2")
+        created = ec2.create_dhcp_options(
+            DhcpConfigurations=[
+                {"Key": "domain-name-servers", "Values": list(servers)},
+            ],
+            TagSpecifications=[{
+                "ResourceType": "dhcp-options",
+                "Tags": [
+                    {"Key": "Name", "Value": f"{cfg.VPC_NAME}-infoblox-dns"},
+                    {"Key": cfg.LAB_TAG_KEY, "Value": cfg.LAB_TAG_VALUE},
+                ],
+            }],
+        )["DhcpOptions"]
+        options_id = created["DhcpOptionsId"]
+
+        ec2.associate_dhcp_options(DhcpOptionsId=options_id, VpcId=vpc_id)
+        return True, (f"{options_id} created and attached to {vpc_id}, "
+                      f"handing out {', '.join(servers)}")
+    except Exception as exc:                                # noqa: BLE001
+        return False, f"could not set the VPC's DNS servers: {exc}"
+
+
 def reboot_test_vm(settle=25, wait=300):
     """
     Reboot the test VM and wait for SSH to come back.
