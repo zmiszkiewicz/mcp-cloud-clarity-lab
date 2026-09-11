@@ -857,6 +857,45 @@ def print_health(rows):
         print(f"  {mark} {label.ljust(width)}  {detail}")
 
 
+def diagnose(client):
+    """
+    Dump the raw host and service records when the health check fails.
+
+    WHY THIS EXISTS. Two consecutive boots failed with the DNS service stuck
+    at state=starting and the host at composite_status=degraded, and both logs
+    said exactly that and nothing more. "It did not start" is not a cause, and
+    without the underlying record there is nothing to reason from — the next
+    failure would read identically and teach nothing.
+
+    detail_hosts and infra/services are undocumented enough that guessing which
+    fields matter has already been wrong twice here, so this prints whatever is
+    actually there rather than a chosen subset.
+    """
+    print("\n--- NIOS-X diagnosis ---")
+
+    try:
+        host = find_host(client)
+        if host:
+            print("host record:")
+            print(json.dumps(host, indent=2, default=str)[:3000])
+        else:
+            print("host record: NONE — the host is not in detail_hosts")
+    except Exception as exc:                                # noqa: BLE001
+        print(f"could not read the host record: {exc}")
+
+    try:
+        service = find_dns_service(client)
+        if service:
+            print("\nDNS service record:")
+            print(json.dumps(service, indent=2, default=str)[:3000])
+        else:
+            print("\nDNS service record: NONE — no dns service on this tenant")
+    except Exception as exc:                                # noqa: BLE001
+        print(f"could not read the service record: {exc}")
+
+    print("------------------------")
+
+
 def save_ids(ids):
     """
     Record what was built, next to the other state files.
@@ -962,6 +1001,7 @@ def main():
             print(f"\n✅ the DNS host is up and answering at {cfg.NIOSX_HOST_IP}")
             return 0
         print("\n❌ the DNS host is not fully healthy; Part 3 will not resolve.")
+        diagnose(client)
         print("   Retry the CSP side with: bash /opt/lab/build-niosx.sh")
         return 1
 
