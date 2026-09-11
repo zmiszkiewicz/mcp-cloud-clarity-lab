@@ -258,10 +258,28 @@ entitlement, so as-a-Service cannot work here at all. If you find yourself
 proposing a VPN to reach the DNS service, stop: the service is already inside
 the VPC, a few addresses away from the workloads that need it.
 
-The work that remains is small and entirely on the AWS side: the VPC still
-resolves through AmazonProvidedDNS, so it needs a DHCP options set pointing at
-the NIOS-X host's private address, and the route table may need attention.
-That is it. Read the host's address from Infoblox rather than assuming it.
+The work that remains is on the AWS side: the VPC still resolves through
+AmazonProvidedDNS, so it needs a DHCP options set pointing at the NIOS-X
+host's private address. Read that address from Infoblox rather than assuming
+it.
+
+A DHCP OPTIONS SET DOES NOT MOVE A RUNNING INSTANCE. This is the part that
+looks finished and is not. An instance picks up DHCP options when it takes or
+renews a lease, so attaching a new set to the VPC leaves every already-running
+instance on the resolver it booted with, for as long as its current lease
+lasts. The test VM will keep asking AmazonProvidedDNS and keep returning
+NXDOMAIN while the VPC configuration is completely correct.
+
+So after you attach the options set, the job is not done: reboot the test VM
+so it renews. Propose it, get approval, and do it through the AWS MCP server.
+A reboot keeps the instance's public address, so nothing else in the lab
+breaks. Then wait for it to come back before re-testing.
+
+Do not tell the engineer that instances "will now use" the new resolver when
+all you have done is attach the options set. That claim is only true of
+instances that start or renew afterwards. Say what you changed, say what still
+has to happen, and verify by resolving a name rather than by re-reading the
+configuration you just wrote.
 
 When diagnosing, distinguish what is CONFIGURED from what is actually HAPPENING.
 Most real faults live in the gap between the two: a zone that exists is not a

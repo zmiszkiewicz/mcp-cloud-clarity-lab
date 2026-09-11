@@ -318,7 +318,15 @@ def _check_c3_cloud(cloud_vpc):
     # not merely whether the service answers if you aim at it.
     fqdn = cfg.APP_FQDN.rstrip(".")
     resolver = cloud_vpc.dns_service_ip()
-    answers, detail = cloud_vpc.resolve_from_test_vm(fqdn, resolver)
+
+    # boot_wait, because the expected way to finish this challenge is to
+    # reboot the test VM: a DHCP options set only reaches an instance when it
+    # renews its lease, so the VM has to restart to use the new resolver. A
+    # participant who does the right thing and clicks Check straight away
+    # would otherwise be failed for SSH being down for thirty seconds —
+    # punished for the step that made it work.
+    answers, detail = cloud_vpc.resolve_from_test_vm(fqdn, resolver,
+                                                     boot_wait=180)
 
     if not answers:
         hint = (" The service may be up but the VPC not yet pointed at it — "

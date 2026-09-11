@@ -627,8 +627,54 @@ def resolve_from_test_vm(fqdn, resolver=None, timeout=120, boot_wait=0):
         return answers, result["stdout"]
 
     where = f"via {resolver}" if resolver else "via the VM's own resolver"
+    detail = result["detail"]
+
+    # THE MOST LIKELY FAILURE IN PART 3, AND THE LEAST OBVIOUS.
+    #
+    # A DHCP options set is applied to an instance when it takes or renews a
+    # lease. Attaching one to the VPC does nothing to an instance that is
+    # already running — it keeps the resolver it booted with until the lease
+    # renews, which can be hours away. So the participant makes exactly the
+    # right change, the console shows the VPC pointing at the NIOS-X host, and
+    # the VM carries on asking AmazonProvidedDNS and answering NXDOMAIN.
+    #
+    # Without this, the evidence for that is one IP address buried in a
+    # stderr string. `.2` in the VPC CIDR is AmazonProvidedDNS by AWS
+    # convention, so seeing it in the answer path is a positive identification
+    # rather than a guess.
+    if not resolver:
+        amazon_dns = _amazon_provided_dns()
+        if amazon_dns and amazon_dns in detail:
+            detail += (
+                f"\n\n   The query went to {amazon_dns}, which is "
+                f"AmazonProvidedDNS — not the Infoblox host. A DHCP options "
+                f"set only takes effect when an instance takes or RENEWS a "
+                f"lease, so attaching one does not move a VM that is already "
+                f"running. The VPC configuration can be completely correct "
+                f"and this still fails.\n"
+                f"   Ask the assistant to reboot the test VM so it picks up "
+                f"the new options, then try again."
+            )
+
     return [], (f"{fqdn} did not resolve from inside the VPC {where}. "
-                f"{result['detail']}")
+                f"{detail}")
+
+
+def _amazon_provided_dns():
+    """
+    The VPC's built-in resolver: the network base address plus two.
+
+    Derived rather than hardcoded, because the lab's CIDR is configurable and
+    a wrong guess here would produce a confidently misleading diagnosis.
+    """
+    cidr = outputs().get("vpc_cidr")
+    if not cidr:
+        return None
+    try:
+        import ipaddress
+        return str(ipaddress.ip_network(cidr, strict=False).network_address + 2)
+    except Exception:                                       # noqa: BLE001
+        return None
 
 
 # --------------------------------------------------------------------------- #
