@@ -677,40 +677,106 @@ def test_vm_resolver():
     return (value or None), (value or "no nameserver line in /etc/resolv.conf")
 
 
-# Renewal methods, tried in order until the resolver changes.
+def vpc_dhcp_dns_servers():
+    """
+    The DNS servers the VPC's DHCP options set hands out.
+
+    Checked BEFORE trying to renew anything. The two reasons a renewal fails
+    look identical from inside the VM — the options set is wrong, or the VM is
+    not picking it up — and they need opposite fixes. Rebooting to fix an
+    options set that was never attached just wastes two minutes and leaves the
+    participant no wiser.
+
+    Returns (servers, detail).
+    """
+    vpc_id = outputs().get("vpc_id")
+    if not vpc_id:
+        return [], "no vpc_id in the terraform outputs"
+
+    try:
+        ec2 = _client("ec2")
+        vpc = ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]
+        options_id = vpc.get("DhcpOptionsId")
+
+        if not options_id or options_id == "default":
+            return [], ("the VPC is still on the default DHCP options, which "
+                        "means AmazonProvidedDNS")
+
+        options = ec2.describe_dhcp_options(
+            DhcpOptionsIds=[options_id])["DhcpOptions"][0]
+        for entry in options.get("DhcpConfigurations", []):
+            if entry.get("Key") == "domain-name-servers":
+                servers = [v["Value"] for v in entry.get("Values", [])]
+                return servers, f"{options_id} hands out {', '.join(servers)}"
+
+        return [], f"{options_id} sets no domain-name-servers"
+    except Exception as exc:                                # noqa: BLE001
+        return [], f"could not read the VPC's DHCP options: {exc}"
+
+
+def reboot_test_vm(settle=25, wait=300):
+    """
+    Reboot the test VM and wait for SSH to come back.
+
+    THE RELIABLE WAY TO RENEW A LEASE, and after trying the alternatives, the
+    only one that works here.
+
+    Forcing a genuine DHCP re-request means bouncing the interface, and every
+    command that does so is issued OVER SSH ON THAT INTERFACE — it kills its
+    own transport, so it either fails or reports success having changed
+    nothing. `nmcli device reapply` does not re-request from the server at
+    all; it re-applies the profile already in memory.
+
+    A reboot sidesteps the whole problem: the instance comes up, asks for a
+    lease, and gets the current options. It keeps its public address, because
+    only stop/start reassigns that.
+
+    `settle` exists so the reachability poll does not succeed against the
+    connection that is about to drop and conclude the VM never went away.
+
+    Returns (ok, detail). Never raises.
+    """
+    instance_id = test_vm_instance_id()
+    if not instance_id:
+        return False, "the test VM could not be found, so it cannot be rebooted"
+
+    try:
+        _client("ec2").reboot_instances(InstanceIds=[instance_id])
+    except Exception as exc:                                # noqa: BLE001
+        return False, f"could not reboot {instance_id}: {exc}"
+
+    time.sleep(settle)
+    reachable, status = test_vm_reachable(instance_id, wait=wait)
+    if not reachable:
+        return False, (f"{instance_id} was rebooted but has not come back "
+                       f"within {wait}s ({status})")
+    return True, f"{instance_id} rebooted and is reachable again"
+
+
+# Tried before the reboot because they cost seconds rather than minutes. None
+# of them has yet been observed to work on Amazon Linux 2023 — see
+# reboot_test_vm for why — so they are an optimisation, not the mechanism.
 #
-# AMAZON LINUX 2023 HAS NO dhclient. It uses NetworkManager's built-in DHCP
-# client, so the `dhclient -r && dhclient` that every DHCP troubleshooting
-# guide reaches for fails with "command not found" — which is why this tries
-# NetworkManager first and keeps dhclient only as a fallback for other images.
-#
-# Each entry is (description, shell command). They run with sudo; the lab's
-# ec2-user has passwordless sudo from the AMI's default cloud-init config.
+# They run with sudo; the lab's ec2-user has passwordless sudo from the AMI's
+# default cloud-init config.
 _RENEW_METHODS = (
-    ("nmcli device reapply",
-     "IFACE=$(ip route show default | awk '{print $5}' | head -1); "
-     "sudo nmcli device reapply \"$IFACE\""),
-    ("NetworkManager restart",
-     "sudo systemctl restart NetworkManager"),
+    ("NetworkManager restart", "sudo systemctl restart NetworkManager"),
     ("dhclient release and renew",
      "IFACE=$(ip route show default | awk '{print $5}' | head -1); "
      "sudo dhclient -r \"$IFACE\" && sudo dhclient \"$IFACE\""),
 )
 
 
-def renew_dhcp_lease(expect=None, settle=6):
+def renew_dhcp_lease(expect=None, settle=6, allow_reboot=True):
     """
     Make the test VM pick up the VPC's current DHCP options.
 
-    WHY NOT JUST REBOOT. A reboot certainly renews the lease, but it costs one
-    to two minutes, drops SSH while it happens, and is a wildly disproportionate
-    way to re-read one config value. Renewing in place takes seconds.
+    Checks the options set first, tries the cheap in-place methods, and falls
+    back to a reboot, which is what actually works on this image.
 
-    SELF-VERIFYING, because none of these commands fails usefully. `nmcli
-    device reapply` exits 0 whether or not it changed the resolver, so trusting
-    the exit status would report success on a VM still pointed at
-    AmazonProvidedDNS. The only trustworthy signal is /etc/resolv.conf before
-    and after, which is what this compares.
+    SELF-VERIFYING THROUGHOUT, because none of these commands fails usefully:
+    they exit 0 whether or not the resolver moved. The only trustworthy signal
+    is /etc/resolv.conf before and after, which is what this compares.
 
     Returns (ok, detail). Never raises.
     """
@@ -721,35 +787,54 @@ def renew_dhcp_lease(expect=None, settle=6):
     if expect and before == expect:
         return True, f"the VM is already using {before}"
 
+    # Is there anything to pick up? Rebooting to fix an options set that was
+    # never attached wastes two minutes and teaches nothing.
+    servers, servers_detail = vpc_dhcp_dns_servers()
+    if not servers:
+        return False, (
+            f"the VM is using {before}, and there is nothing for it to pick "
+            f"up: {servers_detail}.\n   This is the AWS side, not the VM. "
+            f"Attach a DHCP options set naming the DNS host to the VPC first.")
+    if expect and expect not in servers:
+        return False, (
+            f"the VPC's DHCP options name {', '.join(servers)}, which does "
+            f"not include the DNS host at {expect}.\n   Renewing the lease "
+            f"would only fetch the wrong address faster. Fix the options set "
+            f"first.")
+
+    def _settled():
+        time.sleep(settle)
+        return test_vm_resolver()[0]
+
     tried = []
     for description, command in _RENEW_METHODS:
-        result = run_on_test_vm(command, timeout=120)
+        run_on_test_vm(command, timeout=120)
         tried.append(description)
-
-        # Deliberately not checking result["ok"] — see the docstring. A method
-        # that is absent or silently ineffective looks identical to one that
-        # worked, so the resolver is re-read either way.
-        time.sleep(settle)
-        after, after_detail = test_vm_resolver()
-
+        after = _settled()
         if after and after != before:
-            if expect and after != expect:
-                return False, (
-                    f"the resolver changed from {before} to {after}, but "
-                    f"{expect} was expected. The VPC's DHCP options may name a "
-                    f"different address than the DNS host.")
             return True, (f"resolver is now {after} (was {before}), "
                           f"via {description}")
 
-        if expect and after == expect:
-            return True, f"resolver is now {after}, via {description}"
+    if not allow_reboot:
+        return False, (f"the VM is still using {before} after trying "
+                       f"{', '.join(tried)}, and rebooting was not permitted")
 
-    after, _ = test_vm_resolver()
+    print(f"   in-place renewal did not move it ({', '.join(tried)});"
+          f" rebooting, which takes a minute or two...", flush=True)
+
+    ok, detail = reboot_test_vm()
+    if not ok:
+        return False, detail
+
+    after = _settled()
+    if after and after != before:
+        return True, f"resolver is now {after} (was {before}), after a reboot"
+
     return False, (
-        f"the VM is still using {after or before} after trying: "
-        f"{', '.join(tried)}. Either the VPC's DHCP options set does not name "
-        f"the DNS host yet, or this image renews its lease some other way — "
-        f"rebooting the instance always works.")
+        f"the VM is still using {after or before} even after a reboot, while "
+        f"the VPC's DHCP options say {', '.join(servers)}. That is genuinely "
+        f"strange — the instance asked for a lease on boot and should have "
+        f"been given these. Worth telling your facilitator.")
 
 
 def _amazon_provided_dns():

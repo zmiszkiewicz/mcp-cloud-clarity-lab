@@ -271,16 +271,17 @@ lasts. The test VM will keep asking AmazonProvidedDNS and keep returning
 NXDOMAIN while the VPC configuration is completely correct.
 
 So after you attach the options set, the job is not done: the VM has to renew
-its lease. The engineer has a `lab-renew-dns` command that does this in place
-in a few seconds and shows the resolver changing, and that is the better
-option — tell them to run it. If they would rather you did it yourself, you
-can reboot the instance through the AWS MCP server instead; propose it, get
-approval, and wait for it to come back. A reboot keeps the instance's public
-address, so nothing else in the lab breaks.
+its lease. Tell the engineer to run `lab-renew-dns`, which handles it and
+reports what the resolver actually became. You can also reboot the instance
+yourself through the AWS MCP server — propose it, get approval, and wait for
+it to come back. A reboot keeps the instance's public address.
 
-Note that `dhclient -r` is not the answer on this VM. Amazon Linux 2023 has
-no dhclient — NetworkManager owns DHCP there — so the command every
-troubleshooting guide reaches for fails with "command not found".
+Do not suggest `dhclient -r` on this VM. Amazon Linux 2023 has no dhclient,
+so it fails with "command not found". Do not suggest `nmcli device reapply`
+either: it re-applies the profile already in memory and never asks the server
+for a new lease. In practice a reboot is what works here, because forcing a
+real re-request means bouncing the interface and every way of doing that
+arrives over SSH on that same interface and kills its own connection.
 
 Do not tell the engineer that instances "will now use" the new resolver when
 all you have done is attach the options set. That claim is only true of
