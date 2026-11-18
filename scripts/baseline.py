@@ -26,7 +26,7 @@ findings shape this file and are worth knowing before editing:
 import time
 
 import lab_config as cfg
-from csp_client import info, object_url, ok
+from csp_client import CspError, info, object_url, ok
 
 
 LAB_TAGS = {cfg.LAB_TAG_KEY: cfg.LAB_TAG_VALUE}
@@ -117,15 +117,40 @@ def _ensure_record(client, zone_id, name_in_zone, rtype, rdata, comment):
         if row.get("type") == rtype:
             return row
 
-    created = client.post(cfg.path("dns_record"), json_body={
+    body = {
         "zone": zone_id,
         "name_in_zone": name_in_zone,
         "type": rtype,
         "rdata": rdata,
         "comment": comment,
         "tags": LAB_TAGS,
-    })
-    return created.get("result", created)
+    }
+
+    # A zone created a moment ago is not always visible to the record service
+    # yet: the first record POST answers 400 "does not refer to a valid 'Zone'
+    # object" although the zone id is correct. Retry that one error for a short
+    # while; anything else, or the same error persisting, is a real fault and
+    # is reported with what the zone endpoint says about the id we sent.
+    attempts = 8
+    for attempt in range(1, attempts + 1):
+        try:
+            created = client.post(cfg.path("dns_record"), json_body=body)
+            return created.get("result", created)
+        except CspError as exc:
+            if "valid 'Zone' object" not in str(exc):
+                raise
+            if attempt == attempts:
+                try:
+                    seen = client.get(object_url(cfg.path("dns_auth_zone"), zone_id))
+                except CspError as get_exc:
+                    seen = f"GET failed: {get_exc}"
+                raise RuntimeError(
+                    f"record {name_in_zone} {rtype}: zone {zone_id!r} still "
+                    f"rejected after {attempts} attempts. Zone endpoint says: "
+                    f"{seen}") from exc
+            info(f"zone {zone_id} not visible to the record service yet "
+                 f"(attempt {attempt}/{attempts}) — retrying")
+            time.sleep(2)
 
 
 def inventory(client):
