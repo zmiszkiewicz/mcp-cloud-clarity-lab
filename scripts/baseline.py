@@ -60,8 +60,10 @@ def ensure_auth_zone(client, view_id, fqdn=None):
     primary_type "cloud" means the zone data is owned by Universal DDI rather
     than by an external primary — which is what lets a Universal DDI host serve
     it, and therefore what makes the Authoritative DNS Servers list meaningful.
-    Both `fqdn` and `primary_type` are read-only after creation, so getting them
-    right here matters; everything else can be patched later.
+    `primary_type` is computed by the API and REJECTED if sent (HTTP 400 "field
+    is read-only"): a zone with no `external_primaries` comes back "cloud", so
+    simply leave external primaries out. `fqdn` is read-only after creation, so
+    getting it right here matters; everything else can be patched later.
     """
     fqdn = fqdn or cfg.ZONE_FQDN
     existing = client.find_by_name(cfg.path("dns_auth_zone"), fqdn, field="fqdn")
@@ -71,13 +73,19 @@ def ensure_auth_zone(client, view_id, fqdn=None):
 
     created = client.post(cfg.path("dns_auth_zone"), json_body={
         "fqdn": fqdn,
-        "primary_type": "cloud",
         "view": view_id,
         "comment": "TechCorp internal service zone",
         "tags": LAB_TAGS,
     })
+    zone = created.get("result", created)
     ok(f"created auth zone {fqdn}")
-    return created.get("result", created)
+    # primary_type is computed, not sent — confirm the API gave us the "cloud"
+    # zone the rest of the track depends on, rather than finding out in Part 2.
+    got = zone.get("primary_type")
+    if got and got != "cloud":
+        raise RuntimeError(f"auth zone {fqdn} came back primary_type={got!r}, "
+                           "expected 'cloud'")
+    return zone
 
 
 def ensure_records(client, zone_id):
